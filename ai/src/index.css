@@ -15,10 +15,14 @@
 
 #root {
   min-height: 100svh;
+  width: 100%;
+  overflow: hidden;
 }
 
 body {
   margin: 0;
+  min-width: 0;
+  overflow: hidden;
 }
 
 * {
