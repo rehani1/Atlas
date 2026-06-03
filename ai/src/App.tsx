@@ -24,7 +24,6 @@ type ChatMessage = {
 type OllamaModel = {
   name: string
   size: number
-  modified_at: string
 }
 
 declare global {
