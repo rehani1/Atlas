@@ -7,6 +7,12 @@ Version `1.0.0` provides a barebones interface for running local
 models, keeping chat history on the device, and managing downloaded Ollama
 models without a hosted backend.
 
+## Demo
+
+<p align="center">
+  <img src="atlas-ai/src/assets/atlas-demo.gif" alt="Atlas demo" width="900">
+</p>
+
 ## Features
 
 - Local chat interface with a fixed sidebar, collapsible navigation, and a
