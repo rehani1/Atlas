@@ -221,7 +221,7 @@ fn ollama_request(
     let body = body.unwrap_or_default();
     let request = format!(
     "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:11434\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-    body.as_bytes().len(),
+    body.len(),
     body
   );
 
@@ -716,4 +716,53 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{escape_like_pattern, normalize_title, validate_ollama_model_name};
+
+    #[test]
+    fn normalize_title_defaults_for_missing_or_blank_titles() {
+        assert_eq!(normalize_title(None), "New chat");
+        assert_eq!(normalize_title(Some("   ".to_string())), "New chat");
+    }
+
+    #[test]
+    fn normalize_title_trims_and_truncates_long_titles() {
+        assert_eq!(
+            normalize_title(Some("  Focused local workspace  ".to_string())),
+            "Focused local workspace"
+        );
+
+        let long_title = "a".repeat(65);
+        assert_eq!(
+            normalize_title(Some(long_title)),
+            format!("{}...", "a".repeat(64))
+        );
+    }
+
+    #[test]
+    fn escape_like_pattern_escapes_sql_like_wildcards() {
+        assert_eq!(
+            escape_like_pattern(r"100%_local\chat"),
+            r"100\%\_local\\chat"
+        );
+    }
+
+    #[test]
+    fn validate_ollama_model_name_accepts_common_local_model_names() {
+        assert_eq!(
+            validate_ollama_model_name(" llama3.2:3b ").unwrap(),
+            "llama3.2:3b"
+        );
+    }
+
+    #[test]
+    fn validate_ollama_model_name_rejects_empty_or_unsafe_names() {
+        assert!(validate_ollama_model_name("   ").is_err());
+        assert!(validate_ollama_model_name("llama 3").is_err());
+        assert!(validate_ollama_model_name("bad\"name").is_err());
+        assert!(validate_ollama_model_name(r"bad\name").is_err());
+    }
 }
