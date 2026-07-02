@@ -17,10 +17,11 @@ Tailwind CSS, SQLite, and Ollama. The current codebase is intentionally compact:
 - `src-tauri/src/main.rs` only starts `atlas_lib::run()`.
 - Public release docs are `README.md` and `CHANGELOG.md`.
 
-There are no frontend feature folders, typed API wrapper modules, Rust
-`commands`, `app`, `domain`, or `infra` modules, database migration files, job
-tables, event envelopes, diagnostics views, document indexing, memory, export,
-or model benchmark surfaces yet.
+There is a minimal typed frontend API wrapper for touched Ollama status and
+model lifecycle commands in `src/shared/api/tauri.ts`. There are no frontend
+feature folders, Rust `commands`, `app`, `domain`, or `infra` modules, database
+migration files, job tables, event envelopes, diagnostics views, document
+indexing, memory, export, or model benchmark surfaces yet.
 
 ## Tooling
 
@@ -51,7 +52,7 @@ Rust owns privileged operations:
 
 - SQLite connection and queries.
 - Chat and message persistence.
-- Ollama model list, pull, delete, and chat requests.
+- Ollama readiness, model list, pull, delete, and chat requests.
 - Model name validation.
 - Assistant generation cancellation state.
 - Tauri app setup and app-data directory creation.
@@ -80,6 +81,7 @@ create_chat(title: Option<String>) -> ChatSummary
 get_messages(chat_id: String) -> Vec<ChatMessage>
 add_message(chat_id: String, role: String, content: String) -> ChatMessage
 delete_chat(chat_id: String) -> bool
+get_ollama_status(selected_model: Option<String>) -> OllamaStatus
 list_ollama_models() -> Vec<OllamaModel>
 download_ollama_model(model: String) -> Vec<OllamaModel>
 delete_ollama_model(model: String) -> Vec<OllamaModel>
@@ -110,6 +112,12 @@ ChatMessage
 OllamaModel
 - name: string
 - size: number
+
+OllamaStatus
+- status: "unavailable" | "running_with_models" | "running_without_models" | "selected_model_missing"
+- models: OllamaModel[]
+- selected_model: string | null
+- error: string | null
 ```
 
 There are no backend-to-frontend token events or job progress events yet.
@@ -240,6 +248,10 @@ Atlas assumes Ollama is local at `127.0.0.1:11434`.
 
 Current model operations:
 
+- `get_ollama_status(selected_model)` calls `GET /api/tags` and returns one of
+  four readiness states:
+  `unavailable`, `running_with_models`, `running_without_models`, or
+  `selected_model_missing`.
 - `list_ollama_models()` calls `GET /api/tags`.
 - `download_ollama_model(model)` validates the model name, calls
   `POST /api/pull` with `{ "name": model, "stream": false }`, then refreshes
@@ -248,6 +260,8 @@ Current model operations:
   `DELETE /api/delete`, then refreshes the model list.
 
 Model names reject empty strings, whitespace, double quotes, and backslashes.
+An empty Ollama model list is represented as `running_without_models`, not a
+backend exception.
 
 Current limitations:
 
@@ -281,6 +295,7 @@ Current limitations:
 - Current chat messages.
 - Composer draft.
 - Chat/history errors.
+- Ollama readiness status and readiness loading state.
 - Ollama models and selected model.
 - Model panel visibility and model action state.
 - Generation state, including `isResponding` and `respondingChatId`.
@@ -299,6 +314,14 @@ Existing stale-state guards:
 Browser preview behavior is explicit: when not running in Tauri, chat responses
 and model management show limited frontend-only states instead of calling Rust.
 
+The first-run readiness surface handles:
+
+- `unavailable`: short offline copy, retry action, and expandable technical
+  details when available.
+- `running_without_models`: no-model copy, model manager action, and retry.
+- `selected_model_missing`: missing selected-model copy and model manager action.
+- `running_with_models`: no readiness notice.
+
 ## Error Handling
 
 Backend commands return `Result<_, String>`.
@@ -307,8 +330,11 @@ Current user-visible error surfaces:
 
 - `historyError` for chat, search-adjacent chat loading, generation, deletion,
   and database errors.
-- `modelError` for model list, refresh, download, and delete errors.
+- `modelError` for model refresh, download, and delete errors, with expandable
+  technical details where available.
 - `chatSearchError` for search-specific failures.
+- Readiness notices for Ollama offline, no local models, selected model missing,
+  and browser preview.
 
 Ollama connection failures are normalized to:
 
@@ -328,8 +354,8 @@ The frontend suppresses that cancellation message in the active chat error UI.
 
 - `src-tauri/src/lib.rs` mixes domain types, SQLite setup, repositories, Ollama
   HTTP, streaming, cancellation, and Tauri command handlers.
-- The frontend calls `invoke()` directly from `src/App.tsx`; there are no typed
-  API wrappers.
+- The frontend still calls many chat/search `invoke()` commands directly from
+  `src/App.tsx`; only the touched Ollama/model commands have typed wrappers.
 - The schema is inline and repeatable, but not versioned.
 - The SQLite connection is protected by one mutex, so long database work would
   block other database operations.
@@ -343,11 +369,11 @@ The frontend suppresses that cancellation message in the active chat error UI.
 - Search uses `LIKE`, so result quality and scalability are limited.
 - Raw error strings are shown directly in most UI surfaces.
 
-## Chunk 0 Verification Notes
+## Verification Notes
 
-This chunk adds documentation, low-risk unit coverage, and generated-output
-lint hygiene only. It intentionally does not change product behavior, command
-names, serialized fields, schema, or Tauri permissions.
+The baseline and first-run chunks intentionally preserve existing chat
+generation, persistence, cancellation, search, and model lifecycle command names.
+No schema or Tauri permission changes have been added yet.
 
 Relevant checks:
 

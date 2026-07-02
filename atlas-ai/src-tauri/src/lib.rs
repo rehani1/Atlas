@@ -46,6 +46,23 @@ struct OllamaModel {
     size: i64,
 }
 
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OllamaStatusKind {
+    Unavailable,
+    RunningWithModels,
+    RunningWithoutModels,
+    SelectedModelMissing,
+}
+
+#[derive(Serialize)]
+struct OllamaStatus {
+    status: OllamaStatusKind,
+    models: Vec<OllamaModel>,
+    selected_model: Option<String>,
+    error: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct OllamaTagsResponse {
     models: Vec<OllamaModel>,
@@ -203,6 +220,12 @@ fn validate_ollama_model_name(model: &str) -> Result<String, String> {
     Ok(model.to_string())
 }
 
+fn normalize_selected_model(selected_model: Option<String>) -> Option<String> {
+    selected_model
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+}
+
 fn ollama_request(
     method: &str,
     path: &str,
@@ -277,6 +300,34 @@ fn read_ollama_models() -> Result<Vec<OllamaModel>, String> {
         .map_err(|error| error.to_string())?;
 
     Ok(tags.models)
+}
+
+fn build_ollama_status(
+    models: Vec<OllamaModel>,
+    selected_model: Option<String>,
+    error: Option<String>,
+) -> OllamaStatus {
+    let selected_model = normalize_selected_model(selected_model);
+    let status = if error.is_some() {
+        OllamaStatusKind::Unavailable
+    } else if models.is_empty() {
+        OllamaStatusKind::RunningWithoutModels
+    } else if selected_model.as_ref().is_some_and(|selected_model| {
+        !models
+            .iter()
+            .any(|model| model.name == selected_model.as_str())
+    }) {
+        OllamaStatusKind::SelectedModelMissing
+    } else {
+        OllamaStatusKind::RunningWithModels
+    };
+
+    OllamaStatus {
+        status,
+        models,
+        selected_model,
+        error,
+    }
 }
 
 fn stream_ollama_chat(
@@ -564,6 +615,16 @@ fn delete_chat(store: State<'_, ChatStore>, chat_id: String) -> Result<bool, Str
 }
 
 #[tauri::command]
+async fn get_ollama_status(selected_model: Option<String>) -> Result<OllamaStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || match read_ollama_models() {
+        Ok(models) => build_ollama_status(models, selected_model, None),
+        Err(error) => build_ollama_status(Vec::new(), selected_model, Some(error)),
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn list_ollama_models() -> Result<Vec<OllamaModel>, String> {
     tauri::async_runtime::spawn_blocking(read_ollama_models)
         .await
@@ -708,6 +769,7 @@ pub fn run() {
             get_messages,
             add_message,
             delete_chat,
+            get_ollama_status,
             list_ollama_models,
             download_ollama_model,
             delete_ollama_model,
@@ -720,7 +782,17 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_like_pattern, normalize_title, validate_ollama_model_name};
+    use super::{
+        build_ollama_status, escape_like_pattern, normalize_title, validate_ollama_model_name,
+        OllamaModel, OllamaStatusKind,
+    };
+
+    fn test_model(name: &str) -> OllamaModel {
+        OllamaModel {
+            name: name.to_string(),
+            size: 1024,
+        }
+    }
 
     #[test]
     fn normalize_title_defaults_for_missing_or_blank_titles() {
@@ -764,5 +836,38 @@ mod tests {
         assert!(validate_ollama_model_name("llama 3").is_err());
         assert!(validate_ollama_model_name("bad\"name").is_err());
         assert!(validate_ollama_model_name(r"bad\name").is_err());
+    }
+
+    #[test]
+    fn build_ollama_status_reports_unavailable_with_error_details() {
+        let status = build_ollama_status(
+            Vec::new(),
+            Some("llama3.2:3b".to_string()),
+            Some("connection refused".to_string()),
+        );
+
+        assert_eq!(status.status, OllamaStatusKind::Unavailable);
+        assert_eq!(status.selected_model.as_deref(), Some("llama3.2:3b"));
+        assert_eq!(status.error.as_deref(), Some("connection refused"));
+    }
+
+    #[test]
+    fn build_ollama_status_distinguishes_empty_and_ready_model_lists() {
+        let empty_status = build_ollama_status(Vec::new(), None, None);
+        assert_eq!(empty_status.status, OllamaStatusKind::RunningWithoutModels);
+
+        let ready_status = build_ollama_status(vec![test_model("llama3.2:3b")], None, None);
+        assert_eq!(ready_status.status, OllamaStatusKind::RunningWithModels);
+    }
+
+    #[test]
+    fn build_ollama_status_reports_missing_selected_model() {
+        let status = build_ollama_status(
+            vec![test_model("llama3.2:1b")],
+            Some("llama3.2:3b".to_string()),
+            None,
+        );
+
+        assert_eq!(status.status, OllamaStatusKind::SelectedModelMissing);
     }
 }

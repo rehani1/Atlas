@@ -1,5 +1,12 @@
 import { invoke } from '@tauri-apps/api/core'
 import { type FormEvent, useEffect, useRef, useState } from 'react'
+import {
+  deleteOllamaModel,
+  downloadOllamaModel,
+  getOllamaStatus,
+  type OllamaModel,
+  type OllamaStatus,
+} from './shared/api/tauri'
 
 type IconProps = {
   className?: string
@@ -21,9 +28,9 @@ type ChatMessage = {
   created_at: number
 }
 
-type OllamaModel = {
-  name: string
-  size: number
+type UiError = {
+  message: string
+  details?: string
 }
 
 declare global {
@@ -37,6 +44,12 @@ const recommendedModels = [
   { name: 'llama3.2:1b', note: 'Fastest' },
   { name: 'llama3.2:3b', note: 'Best default' },
 ]
+const browserOllamaStatus: OllamaStatus = {
+  status: 'unavailable',
+  models: [],
+  selected_model: null,
+  error: 'Model management is available in the Tauri desktop app.',
+}
 
 function titleFromMessage(content: string) {
   const title = content.trim()
@@ -58,6 +71,129 @@ function formatModelSize(size: number) {
   }
 
   return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`
+}
+
+function buildOllamaStatusFromModels(
+  models: OllamaModel[],
+  selectedModel?: string,
+): OllamaStatus {
+  const selected = selectedModel?.trim() || null
+  const selectedModelMissing =
+    selected !== null && !models.some((model) => model.name === selected)
+
+  return {
+    status:
+      models.length === 0
+        ? 'running_without_models'
+        : selectedModelMissing
+          ? 'selected_model_missing'
+          : 'running_with_models',
+    models,
+    selected_model: selected,
+    error: null,
+  }
+}
+
+function chooseSelectedModel(
+  status: OllamaStatus,
+  currentModel: string,
+  preferredModel?: string,
+) {
+  const preferred = preferredModel?.trim()
+  if (preferred && status.models.some((model) => model.name === preferred)) {
+    return preferred
+  }
+
+  const current = currentModel.trim()
+  if (current && status.models.some((model) => model.name === current)) {
+    return current
+  }
+
+  if (
+    status.status === 'unavailable' ||
+    status.status === 'selected_model_missing'
+  ) {
+    return status.selected_model ?? current
+  }
+
+  return status.models[0]?.name ?? ''
+}
+
+function getReadinessNotice(
+  status: OllamaStatus | null,
+  selectedModel: string,
+  isDesktop: boolean,
+) {
+  if (!isDesktop) {
+    return {
+      title: 'Browser preview',
+      body: 'Open the Tauri desktop app to chat with local models.',
+      details: undefined,
+    }
+  }
+
+  if (!status) {
+    return null
+  }
+
+  if (status.status === 'unavailable') {
+    return {
+      title: 'Ollama is offline',
+      body: 'Start Ollama locally, then retry.',
+      details: status.error ?? undefined,
+    }
+  }
+
+  if (status.status === 'running_without_models') {
+    return {
+      title: 'No local models',
+      body: 'Download a model to start chatting.',
+      details: undefined,
+    }
+  }
+
+  if (status.status === 'selected_model_missing') {
+    const missingModel = selectedModel || status.selected_model || 'Selected model'
+    return {
+      title: 'Selected model missing',
+      body: `${missingModel} is not installed.`,
+      details: undefined,
+    }
+  }
+
+  return null
+}
+
+function getModelPanelEmptyText(status: OllamaStatus | null) {
+  if (status?.status === 'unavailable') {
+    return 'Ollama is offline.'
+  }
+
+  if (status?.status === 'running_without_models') {
+    return 'No local models installed.'
+  }
+
+  return 'No local models found.'
+}
+
+function getChatBlockReason(status: OllamaStatus | null, selectedModel: string) {
+  if (status?.status === 'unavailable') {
+    return 'Ollama is offline. Start Ollama, then retry.'
+  }
+
+  if (status?.status === 'running_without_models') {
+    return 'Download a local model before chatting.'
+  }
+
+  if (status?.status === 'selected_model_missing') {
+    return 'Selected model is not installed. Pick another model.'
+  }
+
+  if (!selectedModel) {
+    return 'Select a local model before chatting.'
+  }
+
+  return null
 }
 
 function ShipWheelLogo({ className = 'h-7 w-7' }: IconProps) {
@@ -189,9 +325,15 @@ function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [draft, setDraft] = useState('')
   const [historyError, setHistoryError] = useState<string | null>(null)
+  const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(() =>
+    isTauriRuntime() ? null : browserOllamaStatus,
+  )
+  const [isOllamaStatusLoading, setIsOllamaStatusLoading] = useState(() =>
+    isTauriRuntime(),
+  )
   const [ollamaModels, setOllamaModels] = useState<OllamaModel[]>([])
   const [selectedModel, setSelectedModel] = useState('')
-  const [modelError, setModelError] = useState<string | null>(null)
+  const [modelError, setModelError] = useState<UiError | null>(null)
   const [modelAction, setModelAction] = useState<string | null>(null)
   const [isModelPanelOpen, setIsModelPanelOpen] = useState(false)
   const [isResponding, setIsResponding] = useState(false)
@@ -240,23 +382,33 @@ function App() {
 
     let ignore = false
 
-    invoke<OllamaModel[]>('list_ollama_models')
-      .then((models) => {
+    getOllamaStatus()
+      .then((status) => {
         if (!ignore) {
-          setOllamaModels(models)
+          setOllamaStatus(status)
+          setOllamaModels(status.models)
           setSelectedModel((currentModel) => {
-            if (models.some((model) => model.name === currentModel)) {
-              return currentModel
-            }
-
-            return models[0]?.name ?? ''
+            return chooseSelectedModel(status, currentModel)
           })
           setModelError(null)
         }
       })
       .catch((error: unknown) => {
         if (!ignore) {
-          setModelError(String(error))
+          const details = String(error)
+          setOllamaStatus({
+            ...browserOllamaStatus,
+            error: details,
+          })
+          setModelError({
+            message: 'Could not check Ollama status.',
+            details,
+          })
+        }
+      })
+      .finally(() => {
+        if (!ignore) {
+          setIsOllamaStatusLoading(false)
         }
       })
 
@@ -346,49 +498,57 @@ function App() {
     ])
   }
 
-  function applyOllamaModels(models: OllamaModel[]) {
-    setOllamaModels(models)
+  function applyOllamaStatus(status: OllamaStatus, preferredModel?: string) {
+    setOllamaStatus(status)
+    setOllamaModels(status.models)
     setSelectedModel((currentModel) => {
-      if (models.some((model) => model.name === currentModel)) {
-        return currentModel
-      }
-
-      return models[0]?.name ?? ''
+      return chooseSelectedModel(status, currentModel, preferredModel)
     })
   }
 
   async function refreshOllamaModels() {
     if (!isTauriRuntime()) {
-      setModelError('Model management is available in the Tauri desktop app.')
+      setOllamaStatus(browserOllamaStatus)
+      setModelError({
+        message: 'Model management requires the Tauri desktop app.',
+      })
       return
     }
 
     try {
       setModelAction('refresh')
-      applyOllamaModels(await invoke<OllamaModel[]>('list_ollama_models'))
+      setIsOllamaStatusLoading(true)
+      applyOllamaStatus(await getOllamaStatus(selectedModel))
       setModelError(null)
     } catch (error) {
-      setModelError(String(error))
+      setModelError({
+        message: 'Could not refresh Ollama status.',
+        details: String(error),
+      })
     } finally {
+      setIsOllamaStatusLoading(false)
       setModelAction(null)
     }
   }
 
   async function handleDownloadModel(model: string) {
     if (!isTauriRuntime()) {
-      setModelError('Model downloads are available in the Tauri desktop app.')
+      setModelError({
+        message: 'Model downloads require the Tauri desktop app.',
+      })
       return
     }
 
     try {
       setModelAction(`download:${model}`)
-      applyOllamaModels(
-        await invoke<OllamaModel[]>('download_ollama_model', { model }),
-      )
-      setSelectedModel(model)
+      const models = await downloadOllamaModel(model)
+      applyOllamaStatus(buildOllamaStatusFromModels(models, model), model)
       setModelError(null)
     } catch (error) {
-      setModelError(String(error))
+      setModelError({
+        message: 'Could not download model.',
+        details: String(error),
+      })
     } finally {
       setModelAction(null)
     }
@@ -396,18 +556,23 @@ function App() {
 
   async function handleDeleteModel(model: string) {
     if (!isTauriRuntime()) {
-      setModelError('Model deletion is available in the Tauri desktop app.')
+      setModelError({
+        message: 'Model deletion requires the Tauri desktop app.',
+      })
       return
     }
 
     try {
       setModelAction(`delete:${model}`)
-      applyOllamaModels(
-        await invoke<OllamaModel[]>('delete_ollama_model', { model }),
-      )
+      const models = await deleteOllamaModel(model)
+      const nextSelectedModel = selectedModel === model ? '' : selectedModel
+      applyOllamaStatus(buildOllamaStatusFromModels(models, nextSelectedModel))
       setModelError(null)
     } catch (error) {
-      setModelError(String(error))
+      setModelError({
+        message: 'Could not delete model.',
+        details: String(error),
+      })
     } finally {
       setModelAction(null)
     }
@@ -457,6 +622,15 @@ function App() {
     closeChatSearch()
   }
 
+  function handleSelectModel(model: string) {
+    setSelectedModel(model)
+    setOllamaStatus((currentStatus) =>
+      currentStatus ? buildOllamaStatusFromModels(currentStatus.models, model) : currentStatus,
+    )
+    setIsModelPanelOpen(false)
+    setHistoryError(null)
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
 
@@ -483,8 +657,9 @@ function App() {
       return
     }
 
-    if (!selectedModel) {
-      setHistoryError('Select a local model before chatting.')
+    const chatBlockReason = getChatBlockReason(ollamaStatus, selectedModel)
+    if (chatBlockReason) {
+      setHistoryError(chatBlockReason)
       return
     }
 
@@ -608,6 +783,17 @@ function App() {
     : chats
   const activeChatIsResponding =
     isResponding && activeChatId !== null && respondingChatId === activeChatId
+  const readinessNotice = getReadinessNotice(
+    ollamaStatus,
+    selectedModel,
+    isTauriRuntime(),
+  )
+  const modelPanelEmptyText = getModelPanelEmptyText(ollamaStatus)
+  const modelDownloadsDisabled =
+    modelAction !== null ||
+    isOllamaStatusLoading ||
+    !isTauriRuntime() ||
+    ollamaStatus?.status === 'unavailable'
 
   return (
     <div className="flex min-h-svh w-full overflow-hidden bg-black text-zinc-50">
@@ -776,7 +962,7 @@ function App() {
                   <button
                     className="h-8 rounded-lg border border-zinc-800 bg-zinc-950 px-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
                     type="button"
-                    disabled={modelAction !== null}
+                    disabled={modelAction !== null || isOllamaStatusLoading}
                     onClick={refreshOllamaModels}
                   >
                     {modelAction === 'refresh' ? 'Refreshing' : 'Refresh'}
@@ -792,6 +978,18 @@ function App() {
                 </div>
               </header>
 
+              {isOllamaStatusLoading ? (
+                <p className="mt-3 rounded-xl bg-zinc-950 px-3 py-2 text-xs text-zinc-500">
+                  Checking Ollama...
+                </p>
+              ) : null}
+
+              {ollamaStatus?.status === 'selected_model_missing' ? (
+                <p className="mt-3 rounded-xl border border-amber-900/60 bg-amber-950/20 px-3 py-2 text-xs text-amber-100">
+                  Selected model is not installed.
+                </p>
+              ) : null}
+
               <div className="mt-3 grid max-h-48 gap-1 overflow-y-auto border-t border-zinc-800/80 pt-3">
                 {ollamaModels.length > 0 ? (
                   ollamaModels.map((model) => (
@@ -806,10 +1004,7 @@ function App() {
                       <button
                         className="min-w-0 flex-1 border-0 bg-transparent p-0 text-left"
                         type="button"
-                        onClick={() => {
-                          setSelectedModel(model.name)
-                          setIsModelPanelOpen(false)
-                        }}
+                        onClick={() => handleSelectModel(model.name)}
                       >
                         <span className="block truncate text-sm text-zinc-100">
                           {model.name}
@@ -837,7 +1032,7 @@ function App() {
                   ))
                 ) : (
                   <p className="rounded-xl bg-zinc-950 px-3 py-2 text-sm text-zinc-500">
-                    No local models found.
+                    {modelPanelEmptyText}
                   </p>
                 )}
               </div>
@@ -871,8 +1066,7 @@ function App() {
                             type="button"
                             disabled={
                               installed ||
-                              modelAction !== null ||
-                              !isTauriRuntime()
+                              modelDownloadsDisabled
                             }
                             onClick={() => handleDownloadModel(model.name)}
                           >
@@ -896,9 +1090,19 @@ function App() {
               ) : null}
 
               {modelError ? (
-                <p className="mt-3 rounded-xl border border-red-900/60 bg-red-950/30 px-3 py-2 text-xs text-red-200">
-                  {modelError}
-                </p>
+                <div className="mt-3 rounded-xl border border-red-900/60 bg-red-950/30 px-3 py-2 text-xs text-red-200">
+                  <p>{modelError.message}</p>
+                  {modelError.details ? (
+                    <details className="mt-2">
+                      <summary className="cursor-pointer text-red-100">
+                        Details
+                      </summary>
+                      <p className="mt-1 break-words text-red-200/80">
+                        {modelError.details}
+                      </p>
+                    </details>
+                  ) : null}
+                </div>
               ) : null}
             </section>
           ) : (
@@ -919,6 +1123,49 @@ function App() {
 
         <div className="absolute inset-x-0 top-20 bottom-28 overflow-y-auto px-4">
           <div className="mx-auto flex max-w-3xl flex-col gap-4">
+            {readinessNotice ? (
+              <section className="mr-auto max-w-[min(100%,34rem)] rounded-2xl border border-zinc-800 bg-zinc-950 px-4 py-3 text-sm text-zinc-200">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="font-medium text-zinc-100">
+                      {readinessNotice.title}
+                    </p>
+                    <p className="mt-1 text-zinc-500">{readinessNotice.body}</p>
+                  </div>
+                  <div className="flex flex-none items-center gap-2">
+                    {isTauriRuntime() ? (
+                      <button
+                        className="rounded-lg border border-zinc-700 px-2.5 py-1 text-xs font-medium text-zinc-200 transition-colors hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+                        type="button"
+                        disabled={modelAction !== null || isOllamaStatusLoading}
+                        onClick={refreshOllamaModels}
+                      >
+                        Retry
+                      </button>
+                    ) : null}
+                    {readinessNotice.title !== 'Ollama is offline' ? (
+                      <button
+                        className="rounded-lg bg-zinc-100 px-2.5 py-1 text-xs font-semibold text-zinc-950 transition-colors hover:bg-white"
+                        type="button"
+                        onClick={() => setIsModelPanelOpen(true)}
+                      >
+                        Models
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+
+                {readinessNotice.details ? (
+                  <details className="mt-3 text-xs text-zinc-500">
+                    <summary className="cursor-pointer text-zinc-400">
+                      Details
+                    </summary>
+                    <p className="mt-1 break-words">{readinessNotice.details}</p>
+                  </details>
+                ) : null}
+              </section>
+            ) : null}
+
             {messages.map((message) => (
               <article
                 className={`max-w-[78%] overflow-hidden rounded-2xl px-4 py-3 text-sm leading-6 break-words ${
