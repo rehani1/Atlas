@@ -18,7 +18,7 @@ import {
   exportChat,
   generateConversationSummary,
   getConversationSummary,
-  getDatabaseDiagnostics,
+  getDiagnosticsCenter,
   getKnowledgePromptSetting,
   getMemoryPromptSetting,
   getOllamaStatus,
@@ -45,7 +45,8 @@ import {
   type ChatMessage,
   type ChatSearchResult,
   type ConversationSummary,
-  type DatabaseDiagnostics,
+  type DiagnosticsCenter,
+  type DiagnosticsJob,
   type DocumentSearchResult,
   type GenerationContextItem,
   type GenerationDocumentSourceUse,
@@ -811,6 +812,23 @@ function saveChatExport(exportedChat: ChatExport) {
   window.setTimeout(() => URL.revokeObjectURL(url), 0)
 }
 
+async function writeClipboardText(text: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text)
+    return
+  }
+
+  const textArea = document.createElement('textarea')
+  textArea.value = text
+  textArea.setAttribute('readonly', 'true')
+  textArea.style.position = 'fixed'
+  textArea.style.opacity = '0'
+  document.body.append(textArea)
+  textArea.select()
+  document.execCommand('copy')
+  textArea.remove()
+}
+
 function upsertJob(jobs: Job[], job: Job) {
   return [job, ...jobs.filter((currentJob) => currentJob.id !== job.id)]
     .sort((first, second) => second.created_at - first.created_at)
@@ -823,6 +841,27 @@ function isActiveJob(job: Job) {
     job.status === 'running' ||
     job.status === 'cancelling'
   )
+}
+
+function jobTypeLabel(jobType: Job['job_type']) {
+  switch (jobType) {
+    case 'chat_generation':
+      return 'Chat generation'
+    case 'model_pull':
+      return 'Model download'
+    case 'model_delete':
+      return 'Model delete'
+    case 'export_conversation':
+      return 'Chat export'
+    case 'document_import':
+      return 'Knowledge indexing'
+    case 'embedding_index':
+      return 'Embedding index'
+    case 'model_benchmark':
+      return 'Model benchmark'
+    case 'conversation_summary':
+      return 'Conversation summary'
+  }
 }
 
 function jobStatusLabel(status: Job['status']) {
@@ -839,6 +878,19 @@ function jobStatusLabel(status: Job['status']) {
       return 'Succeeded'
     case 'failed':
       return 'Failed'
+  }
+}
+
+function ollamaStatusLabel(status: OllamaStatus['status']) {
+  switch (status) {
+    case 'unavailable':
+      return 'Unavailable'
+    case 'running_with_models':
+      return 'Ready'
+    case 'running_without_models':
+      return 'No models'
+    case 'selected_model_missing':
+      return 'Selected model missing'
   }
 }
 
@@ -893,6 +945,32 @@ function formatJobProgress(job: Job) {
 
   if (job.job_type === 'document_import') {
     return `${job.progress_current} / ${job.progress_total} files`
+  }
+
+  const currentMb = job.progress_current / 1024 / 1024
+  const totalMb = job.progress_total / 1024 / 1024
+  return `${currentMb.toFixed(1)} / ${totalMb.toFixed(1)} MB`
+}
+
+function formatDiagnosticsJobProgress(job: DiagnosticsJob) {
+  if (job.progress_current === null || job.progress_total === null) {
+    return jobStatusLabel(job.status)
+  }
+
+  if (job.job_type === 'model_benchmark') {
+    return `${job.progress_current} / ${job.progress_total} prompts`
+  }
+
+  if (job.job_type === 'conversation_summary') {
+    return `${job.progress_current} / ${job.progress_total} steps`
+  }
+
+  if (job.job_type === 'document_import') {
+    return `${job.progress_current} / ${job.progress_total} files`
+  }
+
+  if (job.job_type === 'embedding_index') {
+    return `${job.progress_current} / ${job.progress_total} chunks`
   }
 
   const currentMb = job.progress_current / 1024 / 1024
@@ -1494,13 +1572,12 @@ function App() {
   const [commandQuery, setCommandQuery] = useState('')
   const [activeCommandIndex, setActiveCommandIndex] = useState(0)
   const [isDiagnosticsOpen, setIsDiagnosticsOpen] = useState(false)
-  const [databaseDiagnostics, setDatabaseDiagnostics] =
-    useState<DatabaseDiagnostics | null>(null)
-  const [isDatabaseDiagnosticsLoading, setIsDatabaseDiagnosticsLoading] =
-    useState(false)
-  const [databaseDiagnosticsError, setDatabaseDiagnosticsError] = useState<
-    string | null
-  >(null)
+  const [diagnostics, setDiagnostics] = useState<DiagnosticsCenter | null>(null)
+  const [isDiagnosticsLoading, setIsDiagnosticsLoading] = useState(false)
+  const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null)
+  const [diagnosticsCopyState, setDiagnosticsCopyState] = useState<string | null>(
+    null,
+  )
   const activeChatIdRef = useRef<string | null>(null)
   const commandInputRef = useRef<HTMLInputElement | null>(null)
   const messageRefs = useRef<Map<number, HTMLElement>>(new Map())
@@ -2578,26 +2655,53 @@ function App() {
     }
   }
 
-  async function refreshDatabaseDiagnostics() {
+  async function refreshDiagnostics() {
     if (!isTauriRuntime()) {
-      setDatabaseDiagnosticsError('Diagnostics require the Tauri desktop app.')
+      setDiagnosticsError('Diagnostics require the Tauri desktop app.')
       return
     }
 
     try {
-      setIsDatabaseDiagnosticsLoading(true)
-      setDatabaseDiagnostics(await getDatabaseDiagnostics())
-      setDatabaseDiagnosticsError(null)
+      setIsDiagnosticsLoading(true)
+      setDiagnostics(await getDiagnosticsCenter(selectedModel))
+      setDiagnosticsError(null)
     } catch (error) {
-      setDatabaseDiagnosticsError(String(error))
+      setDiagnosticsError(String(error))
     } finally {
-      setIsDatabaseDiagnosticsLoading(false)
+      setIsDiagnosticsLoading(false)
     }
   }
 
   function openDiagnostics() {
     setIsDiagnosticsOpen(true)
-    void refreshDatabaseDiagnostics()
+    setDiagnosticsCopyState(null)
+    void refreshDiagnostics()
+  }
+
+  async function handleCopyDiagnosticsSummary() {
+    if (!diagnostics) {
+      return
+    }
+
+    try {
+      await writeClipboardText(diagnostics.copy_summary)
+      setDiagnosticsCopyState('Summary copied')
+    } catch (error) {
+      setDiagnosticsCopyState(String(error))
+    }
+  }
+
+  async function handleCopyDatabasePath() {
+    if (!diagnostics) {
+      return
+    }
+
+    try {
+      await writeClipboardText(diagnostics.database.path)
+      setDiagnosticsCopyState('Path copied')
+    } catch (error) {
+      setDiagnosticsCopyState(String(error))
+    }
   }
 
   async function handleDeleteModel(model: string) {
@@ -3553,7 +3657,18 @@ function App() {
 
               {modelError ? (
                 <div className="mt-3 rounded-xl border border-red-900/60 bg-red-950/30 px-3 py-2 text-xs text-red-200">
-                  <p>{modelError.message}</p>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p>{modelError.message}</p>
+                    {isTauriRuntime() ? (
+                      <button
+                        className="rounded-lg border border-red-900/80 px-2 py-1 text-xs font-medium text-red-100 transition-colors hover:bg-red-950/50"
+                        type="button"
+                        onClick={openDiagnostics}
+                      >
+                        Diagnostics
+                      </button>
+                    ) : null}
+                  </div>
                   {modelError.details ? (
                     <details className="mt-2">
                       <summary className="cursor-pointer text-red-100">
@@ -3603,6 +3718,15 @@ function App() {
                         onClick={refreshOllamaModels}
                       >
                         Retry
+                      </button>
+                    ) : null}
+                    {isTauriRuntime() ? (
+                      <button
+                        className="rounded-lg border border-zinc-700 px-2.5 py-1 text-xs font-medium text-zinc-200 transition-colors hover:bg-zinc-900"
+                        type="button"
+                        onClick={openDiagnostics}
+                      >
+                        Diagnostics
                       </button>
                     ) : null}
                     {readinessNotice.title !== 'Ollama is offline' ? (
@@ -3762,9 +3886,18 @@ function App() {
             ) : null}
 
             {historyError ? (
-              <p className="rounded-xl border border-red-900/60 bg-red-950/30 px-4 py-3 text-sm text-red-200">
-                {historyError}
-              </p>
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-red-900/60 bg-red-950/30 px-4 py-3 text-sm text-red-200">
+                <span className="min-w-0 break-words">{historyError}</span>
+                {isTauriRuntime() ? (
+                  <button
+                    className="rounded-lg border border-red-900/80 px-2.5 py-1 text-xs font-medium text-red-100 transition-colors hover:bg-red-950/50"
+                    type="button"
+                    onClick={openDiagnostics}
+                  >
+                    Diagnostics
+                  </button>
+                ) : null}
+              </div>
             ) : null}
           </div>
         </div>
@@ -4897,7 +5030,7 @@ function App() {
 
       {isDiagnosticsOpen ? (
         <div
-          className="fixed inset-0 z-50 bg-black/70 px-4 py-[10vh]"
+          className="fixed inset-0 z-50 bg-black/70 px-4 py-[6vh]"
           onMouseDown={(event) => {
             if (event.target === event.currentTarget) {
               setIsDiagnosticsOpen(false)
@@ -4905,28 +5038,36 @@ function App() {
           }}
         >
           <section
-            className="mx-auto w-full max-w-2xl overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-950 shadow-[0_24px_80px_rgba(0,0,0,0.55)]"
+            className="mx-auto w-full max-w-4xl overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-950 shadow-[0_24px_80px_rgba(0,0,0,0.55)]"
             role="dialog"
             aria-modal="true"
-            aria-label="Database diagnostics"
+            aria-label="Diagnostics Center"
           >
             <header className="flex items-start justify-between gap-4 border-b border-zinc-800 px-4 py-3">
               <div className="min-w-0">
                 <p className="text-sm font-semibold text-zinc-100">
-                  Database diagnostics
+                  Diagnostics Center
                 </p>
                 <p className="mt-0.5 text-xs text-zinc-500">
-                  SQLite storage and integrity
+                  Atlas health, jobs, storage, and local model state
                 </p>
               </div>
               <div className="flex flex-none items-center gap-2">
                 <button
                   className="h-8 rounded-lg border border-zinc-800 px-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
                   type="button"
-                  disabled={isDatabaseDiagnosticsLoading}
-                  onClick={refreshDatabaseDiagnostics}
+                  disabled={!diagnostics}
+                  onClick={handleCopyDiagnosticsSummary}
                 >
-                  {isDatabaseDiagnosticsLoading ? 'Checking' : 'Refresh'}
+                  Copy summary
+                </button>
+                <button
+                  className="h-8 rounded-lg border border-zinc-800 px-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+                  type="button"
+                  disabled={isDiagnosticsLoading}
+                  onClick={refreshDiagnostics}
+                >
+                  {isDiagnosticsLoading ? 'Checking' : 'Refresh'}
                 </button>
                 <button
                   className="grid h-8 w-8 place-items-center rounded-lg border-0 bg-transparent text-zinc-500 transition-colors hover:bg-zinc-900 hover:text-zinc-100"
@@ -4939,33 +5080,32 @@ function App() {
               </div>
             </header>
 
-            <div className="max-h-[min(34rem,70vh)] overflow-y-auto p-4">
-              {databaseDiagnosticsError ? (
+            <div className="max-h-[min(42rem,82vh)] overflow-y-auto p-4">
+              {diagnosticsError ? (
                 <p className="mb-3 rounded-xl border border-red-900/60 bg-red-950/30 px-3 py-2 text-sm text-red-200">
-                  {databaseDiagnosticsError}
+                  {diagnosticsError}
                 </p>
               ) : null}
 
-              {databaseDiagnostics ? (
-                <div className="grid gap-4">
-                  <div className="rounded-xl bg-zinc-900/70 px-3 py-2">
-                    <p className="text-xs text-zinc-500">Path</p>
-                    <p className="mt-1 break-all text-sm text-zinc-100">
-                      {databaseDiagnostics.path}
-                    </p>
-                  </div>
+              {diagnosticsCopyState ? (
+                <p className="mb-3 rounded-xl border border-zinc-800 bg-zinc-900/70 px-3 py-2 text-sm text-zinc-300">
+                  {diagnosticsCopyState}
+                </p>
+              ) : null}
 
+              {diagnostics ? (
+                <div className="grid gap-4">
                   <dl className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                     {[
-                      ['Database', formatBytes(databaseDiagnostics.database_size_bytes)],
-                      ['WAL', formatBytes(databaseDiagnostics.wal_size_bytes)],
-                      ['Shared memory', formatBytes(databaseDiagnostics.shm_size_bytes)],
-                      ['Journal', databaseDiagnostics.journal_mode],
-                      ['Schema', `v${databaseDiagnostics.user_version}`],
-                      ['Integrity', databaseDiagnostics.integrity_check],
-                      ['Pages', databaseDiagnostics.page_count.toLocaleString()],
-                      ['Page size', formatBytes(databaseDiagnostics.page_size)],
-                      ['Free pages', databaseDiagnostics.freelist_count.toLocaleString()],
+                      ['App version', diagnostics.app_version],
+                      ['Generated', formatTimestamp(diagnostics.generated_at)],
+                      ['Ollama', ollamaStatusLabel(diagnostics.ollama.status)],
+                      ['Installed models', diagnostics.ollama.models.length.toLocaleString()],
+                      ['Active model', diagnostics.ollama.selected_model ?? 'None'],
+                      ['Running jobs', diagnostics.jobs.running.length.toLocaleString()],
+                      ['Failed jobs', diagnostics.jobs.recent_failed.length.toLocaleString()],
+                      ['Indexed docs', diagnostics.knowledge.indexed_document_count.toLocaleString()],
+                      ['Chunks', diagnostics.knowledge.chunk_count.toLocaleString()],
                     ].map(([label, value]) => (
                       <div
                         className="min-w-0 rounded-xl bg-zinc-900/70 px-3 py-2"
@@ -4979,12 +5119,254 @@ function App() {
                     ))}
                   </dl>
 
-                  <div>
+                  <section className="grid gap-3 rounded-xl border border-zinc-800 px-3 py-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <p className="text-xs font-semibold tracking-[0.08em] text-zinc-500 uppercase">
+                        Ollama
+                      </p>
+                      {diagnostics.ollama.error ? (
+                        <span className="rounded-lg bg-red-950/40 px-2 py-1 text-xs text-red-200">
+                          {diagnostics.ollama.error}
+                        </span>
+                      ) : null}
+                    </div>
+                    {diagnostics.ollama.models.length > 0 ? (
+                      <div className="grid gap-1 sm:grid-cols-2">
+                        {diagnostics.ollama.models.map((model) => (
+                          <div
+                            className="flex min-w-0 items-center justify-between gap-3 rounded-lg bg-zinc-900/70 px-3 py-2 text-sm"
+                            key={model.name}
+                          >
+                            <span className="min-w-0 truncate text-zinc-200">
+                              {model.name}
+                            </span>
+                            <span className="flex-none text-zinc-500">
+                              {formatModelSize(model.size)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="rounded-lg bg-zinc-900/70 px-3 py-2 text-sm text-zinc-500">
+                        No installed models reported.
+                      </p>
+                    )}
+                  </section>
+
+                  <section className="grid gap-3 rounded-xl border border-zinc-800 px-3 py-3">
+                    <p className="text-xs font-semibold tracking-[0.08em] text-zinc-500 uppercase">
+                      Jobs
+                    </p>
+                    <dl className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                      {[
+                        ['Embedding queued', diagnostics.jobs.embedding_queue.queued],
+                        ['Embedding running', diagnostics.jobs.embedding_queue.running],
+                        ['Embedding cancelling', diagnostics.jobs.embedding_queue.cancelling],
+                        ['Embedding failed', diagnostics.jobs.embedding_queue.recent_failed],
+                      ].map(([label, value]) => (
+                        <div
+                          className="rounded-lg bg-zinc-900/70 px-3 py-2"
+                          key={label}
+                        >
+                          <dt className="text-xs text-zinc-500">{label}</dt>
+                          <dd className="mt-1 text-sm text-zinc-100">
+                            {Number(value).toLocaleString()}
+                          </dd>
+                        </div>
+                      ))}
+                    </dl>
+
+                    {diagnostics.jobs.running.length > 0 ? (
+                      <div className="grid gap-1">
+                        {diagnostics.jobs.running.map((job) => (
+                          <div
+                            className="rounded-lg bg-zinc-900/70 px-3 py-2 text-sm"
+                            key={job.id}
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <span className="font-medium text-zinc-200">
+                                {jobTypeLabel(job.job_type)}
+                              </span>
+                              <span className="text-xs text-zinc-500">
+                                {formatDiagnosticsJobProgress(job)}
+                              </span>
+                            </div>
+                            <p className="mt-1 break-words text-xs text-zinc-500">
+                              {job.label}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="rounded-lg bg-zinc-900/70 px-3 py-2 text-sm text-zinc-500">
+                        No running jobs.
+                      </p>
+                    )}
+
+                    {diagnostics.jobs.recent_failed.length > 0 ? (
+                      <div className="grid gap-1">
+                        {diagnostics.jobs.recent_failed.map((job) => (
+                          <div
+                            className="rounded-lg border border-red-950/50 bg-red-950/20 px-3 py-2 text-sm"
+                            key={job.id}
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <span className="font-medium text-red-100">
+                                {jobTypeLabel(job.job_type)}
+                              </span>
+                              <span className="text-xs text-red-200/70">
+                                {formatTimestamp(job.completed_at ?? job.created_at)}
+                              </span>
+                            </div>
+                            <p className="mt-1 break-words text-xs text-red-100/80">
+                              {job.error_message ?? job.label}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </section>
+
+                  <section className="grid gap-3 rounded-xl border border-zinc-800 px-3 py-3">
+                    <p className="text-xs font-semibold tracking-[0.08em] text-zinc-500 uppercase">
+                      Knowledge
+                    </p>
+                    <dl className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                      {[
+                        ['Workspaces', diagnostics.knowledge.workspace_count],
+                        ['Active documents', diagnostics.knowledge.document_count],
+                        ['Indexed documents', diagnostics.knowledge.indexed_document_count],
+                        ['Deleted documents', diagnostics.knowledge.deleted_document_count],
+                        ['Chunks', diagnostics.knowledge.chunk_count],
+                        ['Last indexed', formatTimestamp(diagnostics.knowledge.last_indexed_at)],
+                      ].map(([label, value]) => (
+                        <div
+                          className="rounded-lg bg-zinc-900/70 px-3 py-2"
+                          key={label}
+                        >
+                          <dt className="text-xs text-zinc-500">{label}</dt>
+                          <dd className="mt-1 text-sm text-zinc-100">
+                            {typeof value === 'number'
+                              ? value.toLocaleString()
+                              : value}
+                          </dd>
+                        </div>
+                      ))}
+                    </dl>
+                  </section>
+
+                  <section className="grid gap-3 rounded-xl border border-zinc-800 px-3 py-3">
+                    <p className="text-xs font-semibold tracking-[0.08em] text-zinc-500 uppercase">
+                      Model speed
+                    </p>
+                    {diagnostics.model_speeds.length > 0 ? (
+                      <div className="grid gap-1">
+                        {diagnostics.model_speeds.map((speed) => (
+                          <div
+                            className="grid gap-2 rounded-lg bg-zinc-900/70 px-3 py-2 text-sm sm:grid-cols-[minmax(0,1fr)_auto_auto]"
+                            key={speed.model_name}
+                          >
+                            <span className="min-w-0 truncate text-zinc-200">
+                              {speed.model_name}
+                            </span>
+                            <span className="text-zinc-500">
+                              Chat {formatTokensPerSecond(speed.average_tokens_per_second) ?? 'n/a'}
+                            </span>
+                            <span className="text-zinc-500">
+                              Bench {formatTokensPerSecond(speed.benchmark_average_tokens_per_second) ?? 'n/a'}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="rounded-lg bg-zinc-900/70 px-3 py-2 text-sm text-zinc-500">
+                        No completed speed metrics.
+                      </p>
+                    )}
+                  </section>
+
+                  <section className="grid gap-3 rounded-xl border border-zinc-800 px-3 py-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <p className="text-xs font-semibold tracking-[0.08em] text-zinc-500 uppercase">
+                        Database
+                      </p>
+                      <button
+                        className="rounded-lg border border-zinc-800 px-2 py-1 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900"
+                        type="button"
+                        onClick={handleCopyDatabasePath}
+                      >
+                        Copy path
+                      </button>
+                    </div>
+                    <div className="rounded-lg bg-zinc-900/70 px-3 py-2">
+                      <p className="text-xs text-zinc-500">Path</p>
+                      <p className="mt-1 break-all text-sm text-zinc-100">
+                        {diagnostics.database.path}
+                      </p>
+                    </div>
+                    <dl className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                      {[
+                        ['Database', formatBytes(diagnostics.database.database_size_bytes)],
+                        ['WAL', formatBytes(diagnostics.database.wal_size_bytes)],
+                        ['Shared memory', formatBytes(diagnostics.database.shm_size_bytes)],
+                        ['Journal', diagnostics.database.journal_mode],
+                        ['Schema', `v${diagnostics.database.user_version}`],
+                        ['Integrity', diagnostics.database.integrity_check],
+                        ['Pages', diagnostics.database.page_count.toLocaleString()],
+                        ['Page size', formatBytes(diagnostics.database.page_size)],
+                        ['Free pages', diagnostics.database.freelist_count.toLocaleString()],
+                      ].map(([label, value]) => (
+                        <div
+                          className="min-w-0 rounded-lg bg-zinc-900/70 px-3 py-2"
+                          key={label}
+                        >
+                          <dt className="text-xs text-zinc-500">{label}</dt>
+                          <dd className="mt-1 truncate text-sm text-zinc-100">
+                            {value}
+                          </dd>
+                        </div>
+                      ))}
+                    </dl>
+                  </section>
+
+                  <section className="grid gap-3 rounded-xl border border-zinc-800 px-3 py-3">
+                    <p className="text-xs font-semibold tracking-[0.08em] text-zinc-500 uppercase">
+                      Recent backend errors
+                    </p>
+                    {diagnostics.recent_errors.length > 0 ? (
+                      <div className="grid gap-1">
+                        {diagnostics.recent_errors.map((error) => (
+                          <div
+                            className="rounded-lg border border-red-950/50 bg-red-950/20 px-3 py-2 text-sm"
+                            key={`${error.source}:${error.occurred_at}:${error.label}`}
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <span className="font-medium text-red-100">
+                                {error.source} - {error.label}
+                              </span>
+                              <span className="text-xs text-red-200/70">
+                                {formatTimestamp(error.occurred_at)}
+                              </span>
+                            </div>
+                            <p className="mt-1 break-words text-xs text-red-100/80">
+                              {error.message}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="rounded-lg bg-zinc-900/70 px-3 py-2 text-sm text-zinc-500">
+                        No recent backend errors.
+                      </p>
+                    )}
+                  </section>
+
+                  <section>
                     <p className="mb-2 text-xs font-semibold tracking-[0.08em] text-zinc-500 uppercase">
                       Tables
                     </p>
                     <div className="grid gap-1">
-                      {databaseDiagnostics.table_counts.map((table) => (
+                      {diagnostics.database.table_counts.map((table) => (
                         <div
                           className="flex items-center justify-between gap-3 rounded-lg bg-zinc-900/70 px-3 py-2 text-sm"
                           key={table.table_name}
@@ -4996,12 +5378,12 @@ function App() {
                         </div>
                       ))}
                     </div>
-                  </div>
+                  </section>
                 </div>
               ) : (
                 <p className="py-8 text-center text-sm text-zinc-500">
-                  {isDatabaseDiagnosticsLoading
-                    ? 'Checking database...'
+                  {isDiagnosticsLoading
+                    ? 'Checking diagnostics...'
                     : 'No diagnostics loaded.'}
                 </p>
               )}

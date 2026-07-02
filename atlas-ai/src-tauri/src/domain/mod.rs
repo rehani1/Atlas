@@ -1,6 +1,7 @@
 pub(crate) mod benchmark;
 pub(crate) mod context;
 pub(crate) mod database;
+pub(crate) mod diagnostics;
 pub(crate) mod job;
 pub(crate) mod knowledge;
 pub(crate) mod memory;

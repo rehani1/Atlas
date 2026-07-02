@@ -3,13 +3,15 @@ mod domain;
 mod infra;
 
 use app::{
-    benchmarks as benchmark_service, context as context_service, jobs as job_service,
-    knowledge as knowledge_service, memories as memory_service, models as model_service,
-    summaries as summary_service, tools as tool_service,
+    benchmarks as benchmark_service, context as context_service,
+    diagnostics as diagnostics_service, jobs as job_service, knowledge as knowledge_service,
+    memories as memory_service, models as model_service, summaries as summary_service,
+    tools as tool_service,
 };
 use domain::benchmark::{ModelBenchmark, ModelUsage};
 use domain::context::GenerationContextItem;
 use domain::database::DatabaseDiagnostics;
+use domain::diagnostics::DiagnosticsCenter;
 use domain::job::{Job, JobEvent, JobStatus, JobType};
 use domain::knowledge::{
     DocumentSearchResult, GenerationDocumentSourceUse, KnowledgeChunk, KnowledgeDocument,
@@ -2374,6 +2376,31 @@ fn get_database_diagnostics(store: State<'_, ChatStore>) -> Result<DatabaseDiagn
 }
 
 #[tauri::command]
+async fn get_diagnostics_center(
+    store: State<'_, ChatStore>,
+    selected_model: Option<String>,
+) -> Result<DiagnosticsCenter, String> {
+    let ollama =
+        tauri::async_runtime::spawn_blocking(move || model_service::get_status(selected_model))
+            .await
+            .map_err(|error| error.to_string())?;
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+
+    diagnostics_service::collect(
+        &conn,
+        diagnostics_service::DiagnosticsInput {
+            app_version: env!("CARGO_PKG_VERSION"),
+            generated_at: now_millis()?,
+            database_path: &store.db_path,
+            ollama,
+        },
+    )
+}
+
+#[tauri::command]
 fn list_model_benchmarks(
     store: State<'_, ChatStore>,
     limit: Option<i64>,
@@ -3253,6 +3280,7 @@ pub fn run() {
             list_ollama_models,
             list_jobs,
             get_database_diagnostics,
+            get_diagnostics_center,
             list_model_benchmarks,
             list_model_usage,
             cancel_job,
@@ -3278,9 +3306,9 @@ mod tests {
     };
 
     use super::app::{
-        benchmarks as benchmark_service, context as context_service, jobs as job_service,
-        knowledge as knowledge_service, memories as memory_service, summaries as summary_service,
-        tools as tool_service,
+        benchmarks as benchmark_service, context as context_service,
+        diagnostics as diagnostics_service, jobs as job_service, knowledge as knowledge_service,
+        memories as memory_service, summaries as summary_service, tools as tool_service,
     };
     use super::domain::benchmark::ModelBenchmarkStatus;
     use super::domain::job::{JobStatus, JobType};
@@ -3985,6 +4013,192 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&workspace_path);
+    }
+
+    #[test]
+    fn diagnostics_center_summarizes_health_without_private_copy_content() {
+        let conn = Connection::open_in_memory().unwrap();
+        sqlite::setup_database(&conn).unwrap();
+        conn.execute(
+            "
+            INSERT INTO chats (id, title, created_at, updated_at)
+            VALUES ('chat-1', 'Private Chat Title', 100, 100)
+            ",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "
+            INSERT INTO messages (chat_id, role, content, created_at)
+            VALUES ('chat-1', 'user', 'PRIVATE_MESSAGE_BODY', 125)
+            ",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "
+            INSERT INTO workspaces (id, name, root_path, created_at, updated_at)
+            VALUES ('workspace-1', 'Private Workspace', '/Users/rehan/private', 100, 100)
+            ",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "
+            INSERT INTO documents (
+              id,
+              workspace_id,
+              path,
+              file_name,
+              extension,
+              content_hash,
+              size_bytes,
+              modified_at,
+              indexed_at
+            )
+            VALUES (
+              'document-1',
+              'workspace-1',
+              '/Users/rehan/private/secret.md',
+              'secret.md',
+              'md',
+              'hash',
+              42,
+              90,
+              110
+            )
+            ",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "
+            INSERT INTO document_chunks (
+              id,
+              document_id,
+              chunk_index,
+              content,
+              start_byte,
+              end_byte,
+              start_line,
+              end_line,
+              token_count_estimate,
+              created_at
+            )
+            VALUES (
+              'chunk-1',
+              'document-1',
+              0,
+              'PRIVATE_INDEXED_CONTENT',
+              0,
+              22,
+              1,
+              1,
+              4,
+              120
+            )
+            ",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "
+            INSERT INTO generation_runs (
+              id,
+              conversation_id,
+              model_name,
+              started_at,
+              completed_at,
+              status,
+              eval_count,
+              eval_duration_ms,
+              tokens_per_second
+            )
+            VALUES (
+              'run-1',
+              'chat-1',
+              'llama3.2:3b',
+              130,
+              160,
+              'completed',
+              50,
+              5000,
+              10.0
+            )
+            ",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "
+            INSERT INTO generation_runs (
+              id,
+              conversation_id,
+              model_name,
+              started_at,
+              completed_at,
+              status,
+              error_message
+            )
+            VALUES (
+              'run-2',
+              'chat-1',
+              'llama3.2:3b',
+              170,
+              180,
+              'failed',
+              'PRIVATE_PROMPT_ERROR'
+            )
+            ",
+            [],
+        )
+        .unwrap();
+        let job = job_service::create(
+            &conn,
+            JobType::DocumentImport,
+            "Queued index for private-notes",
+            Some(r#"{"path":"/Users/rehan/private/secret.md"}"#),
+            200,
+        )
+        .unwrap();
+        job_service::finish_failed(&conn, &job.id, "Failed /Users/rehan/private/secret.md", 225)
+            .unwrap();
+
+        let diagnostics = diagnostics_service::collect(
+            &conn,
+            diagnostics_service::DiagnosticsInput {
+                app_version: "1.0.0-test",
+                generated_at: 250,
+                database_path: std::path::Path::new("/Users/rehan/private/atlas.sqlite3"),
+                ollama: build_ollama_status(
+                    vec![test_model("llama3.2:3b")],
+                    Some("llama3.2:3b".to_string()),
+                    None,
+                ),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(diagnostics.app_version, "1.0.0-test");
+        assert_eq!(diagnostics.knowledge.indexed_document_count, 1);
+        assert_eq!(diagnostics.knowledge.chunk_count, 1);
+        assert_eq!(diagnostics.jobs.recent_failed.len(), 1);
+        assert!(diagnostics
+            .recent_errors
+            .iter()
+            .any(|error| error.message.contains("PRIVATE_PROMPT_ERROR")));
+        assert!(diagnostics
+            .model_speeds
+            .iter()
+            .any(|speed| speed.model_name == "llama3.2:3b"
+                && speed.average_tokens_per_second == Some(10.0)));
+
+        assert!(!diagnostics.copy_summary.contains("PRIVATE_MESSAGE_BODY"));
+        assert!(!diagnostics.copy_summary.contains("PRIVATE_INDEXED_CONTENT"));
+        assert!(!diagnostics.copy_summary.contains("PRIVATE_PROMPT_ERROR"));
+        assert!(!diagnostics.copy_summary.contains("/Users/rehan"));
+        assert!(!diagnostics.copy_summary.contains("secret.md"));
+        assert!(!diagnostics.copy_summary.contains("private-notes"));
     }
 
     #[test]

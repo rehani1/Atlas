@@ -24,6 +24,7 @@ Tailwind CSS, SQLite, and Ollama. The current codebase is intentionally compact:
   `src-tauri/src/domain/memory.rs`, `src-tauri/src/app/memories.rs`,
   `src-tauri/src/domain/knowledge.rs`, `src-tauri/src/app/knowledge.rs`,
   `src-tauri/src/domain/context.rs`, `src-tauri/src/app/context.rs`,
+  `src-tauri/src/domain/diagnostics.rs`, `src-tauri/src/app/diagnostics.rs`,
   `src-tauri/src/domain/tools.rs`, `src-tauri/src/app/tools.rs`,
   `src-tauri/src/infra/jobs.rs`, `src-tauri/src/domain/database.rs`,
   `src-tauri/src/domain/search.rs`, `src-tauri/src/infra/search.rs`,
@@ -36,8 +37,8 @@ Tailwind CSS, SQLite, and Ollama. The current codebase is intentionally compact:
 
 There is a minimal typed frontend API wrapper for touched Ollama status, model
 lifecycle, export, jobs, database diagnostics, rich search, summaries, memory,
-benchmark, knowledge workspace, and local tool-call commands in
-`src/shared/api/tauri.ts`.
+benchmark, knowledge workspace, local tool-call, and diagnostics center commands
+in `src/shared/api/tauri.ts`.
 There are no frontend feature folders, Rust `commands` module, database
 migrations directory, PDF/DOCX import, embeddings, or file watcher yet.
 
@@ -118,6 +119,7 @@ download_ollama_model(model: String) -> Job
 delete_ollama_model(model: String) -> Vec<OllamaModel>
 list_jobs(limit: Option<i64>) -> Vec<Job>
 get_database_diagnostics() -> DatabaseDiagnostics
+get_diagnostics_center(selected_model: Option<String>) -> DiagnosticsCenter
 get_conversation_summary(chat_id: String) -> Option<ConversationSummary>
 save_conversation_summary(chat_id: String, summary: String, enabled_for_prompt: bool) -> ConversationSummary
 set_conversation_summary_enabled(chat_id: String, enabled_for_prompt: bool) -> ConversationSummary
@@ -245,6 +247,62 @@ DatabaseDiagnostics
 - freelist_count: number
 - integrity_check: string
 - table_counts: DatabaseTableCount[]
+
+DiagnosticsJob
+- id: string
+- job_type: Job.job_type
+- status: Job.status
+- label: string
+- progress_current: number | null
+- progress_total: number | null
+- error_message: string | null
+- created_at: number
+- started_at: number | null
+- completed_at: number | null
+
+DiagnosticsQueue
+- queued: number
+- running: number
+- cancelling: number
+- recent_failed: number
+
+DiagnosticsJobs
+- running: DiagnosticsJob[]
+- recent_failed: DiagnosticsJob[]
+- embedding_queue: DiagnosticsQueue
+
+DiagnosticsKnowledge
+- workspace_count: number
+- document_count: number
+- indexed_document_count: number
+- deleted_document_count: number
+- chunk_count: number
+- last_indexed_at: number | null
+
+DiagnosticsModelSpeed
+- model_name: string
+- generation_count: number
+- average_tokens_per_second: number | null
+- last_used_at: number | null
+- benchmark_count: number
+- benchmark_average_tokens_per_second: number | null
+
+DiagnosticsError
+- source: string
+- label: string
+- message: string
+- occurred_at: number
+
+DiagnosticsCenter
+- app_version: string
+- generated_at: number
+- ollama: OllamaStatus
+- database: DatabaseDiagnostics
+- jobs: DiagnosticsJobs
+- knowledge: DiagnosticsKnowledge
+- model_speeds: DiagnosticsModelSpeed[]
+- recent_errors: DiagnosticsError[]
+- copy_summary: string
 
 SearchSnippetPart
 - text: string
@@ -949,6 +1007,12 @@ Persistence behavior:
   and table counts for core tables, FTS tables, benchmark tables, summary
   tables, memory tables, knowledge tables, context item tables, and tool-call
   tables. It does not export chat content or mutate user data.
+- `get_diagnostics_center(selected_model)` is read-only and aggregates app
+  version, Ollama status/models, active/failed jobs, embedding queue counts,
+  SQLite diagnostics, indexed document/chunk counts, average model speed from
+  completed generations and benchmarks, and recent backend errors. It does not
+  include prompts, message bodies, indexed file content, memory content, job
+  payload/result JSON, or raw private data in its default copied summary.
 
 ## Chat Generation Flow
 
@@ -1222,7 +1286,8 @@ Current limitations:
 - Model Lab visibility, benchmark history, model usage rows, loading/action
   state, and error state.
 - Recent job records from `list_jobs` and `job_updated` events.
-- Database diagnostics modal, loading state, and error state.
+- Diagnostics Center modal, aggregate diagnostics payload, loading/error state,
+  and copy status for sanitized summary or explicit database path copy.
 - Export menu visibility and active export format.
 - Command palette state, command query, active command index, command registry,
   fuzzy filtering, and disabled command reasons.
@@ -1257,7 +1322,7 @@ The command palette opens with `Cmd/Ctrl+K`, focuses its search field, supports
 arrow/enter keyboard selection, and closes on escape or backdrop click. Initial
 enabled commands call existing handlers for new chat, chat search, model manager
 open, model refresh, model selection, recommended model downloads, database
-diagnostics, Model Lab, chat summaries, and active chat deletion when valid. It
+diagnostics center, Model Lab, chat summaries, and active chat deletion when valid. It
 also exposes Memory Inspector and active-chat export commands for Markdown,
 JSON, and plain text.
 Future surfaces
@@ -1295,10 +1360,15 @@ with highlighted matches. Selecting a message result opens the conversation,
 scrolls to that message, and briefly outlines it. Browser preview mode keeps the
 old title-only local filter.
 
-The diagnostics command opens a focused database diagnostics modal in desktop
-mode. It shows SQLite path, database/WAL/SHM sizes, journal mode, schema version,
-integrity result, page stats, and core table counts. It is intentionally smaller
-than the future diagnostics center planned for later chunks.
+The diagnostics command opens the Diagnostics Center in desktop mode. It shows
+app version, generated timestamp, Ollama connection state, installed and active
+models, active and failed jobs, embedding queue counts, indexed document/chunk
+counts, model speed averages, recent backend errors, SQLite path/size/integrity,
+and table counts. The default copy action uses the backend-provided sanitized
+summary and excludes raw paths, prompts, message bodies, memory content, and
+indexed file content. Database path copying is a separate visible action.
+Readiness notices, model errors, chat/history errors, and the command palette
+link to the same center.
 
 The active chat action group includes an export menu. Export rendering is
 backend-owned through `export_chat`; the frontend turns the returned content
@@ -1334,7 +1404,7 @@ Current user-visible error surfaces:
 - `memoryError` for memory loading, creation, editing, archive/restore, forget,
   source jumping, and prompt-use toggling failures.
 - `chatSearchError` for search-specific failures.
-- `databaseDiagnosticsError` for database diagnostics loading failures.
+- `diagnosticsError` for Diagnostics Center loading failures.
 - Readiness notices for Ollama offline, no local models, selected model missing,
   and browser preview.
 - Per-message generation details for assistant messages with associated
@@ -1374,8 +1444,8 @@ The frontend suppresses that cancellation message in the active chat error UI.
   incremental migrations directory for future versions.
 - The SQLite connection is protected by one mutex, so long database work would
   block other database operations.
-- Database diagnostics are a focused modal, not the full diagnostics center
-  planned for later chunks.
+- Diagnostics Center is still a modal owned by `src/App.tsx`; it is not yet a
+  dedicated page, log export surface, or plugin-backed log collector.
 - Chat generation now has explicit context assembly and diagnostics, but the
   assembler is still owned from `lib.rs` command flow rather than a dedicated
   command module.
@@ -1431,6 +1501,12 @@ Chunk 14 adds permissioned local tool-call parsing, `tool_calls` and
 `tool_permissions`, the `resolve_tool_call` command, visible per-message
 tool-call cards, deny/allow decisions, and read-limited Rust execution for
 `search_index`, `read_file_chunk`, and `get_model_stats`.
+Chunk 15 adds the read-only Diagnostics Center service and
+`get_diagnostics_center` command, aggregate app/Ollama/job/database/knowledge
+and model-speed diagnostics, visible active/failed job and backend-error lists,
+direct links from readiness/error states, and a sanitized copy summary that
+omits prompts, message bodies, memory content, indexed file content, job
+payloads, and raw paths by default.
 
 Relevant checks:
 

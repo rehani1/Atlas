@@ -117,6 +117,69 @@ export type DatabaseDiagnostics = {
   table_counts: DatabaseTableCount[]
 }
 
+export type DiagnosticsJob = {
+  id: string
+  job_type: JobType
+  status: JobStatus
+  label: string
+  progress_current: number | null
+  progress_total: number | null
+  error_message: string | null
+  created_at: number
+  started_at: number | null
+  completed_at: number | null
+}
+
+export type DiagnosticsQueue = {
+  queued: number
+  running: number
+  cancelling: number
+  recent_failed: number
+}
+
+export type DiagnosticsJobs = {
+  running: DiagnosticsJob[]
+  recent_failed: DiagnosticsJob[]
+  embedding_queue: DiagnosticsQueue
+}
+
+export type DiagnosticsKnowledge = {
+  workspace_count: number
+  document_count: number
+  indexed_document_count: number
+  deleted_document_count: number
+  chunk_count: number
+  last_indexed_at: number | null
+}
+
+export type DiagnosticsModelSpeed = {
+  model_name: string
+  generation_count: number
+  average_tokens_per_second: number | null
+  last_used_at: number | null
+  benchmark_count: number
+  benchmark_average_tokens_per_second: number | null
+}
+
+export type DiagnosticsError = {
+  source: string
+  label: string
+  message: string
+  occurred_at: number
+}
+
+export type DiagnosticsCenter = {
+  app_version: string
+  generated_at: number
+  ollama: OllamaStatus
+  database: DatabaseDiagnostics
+  jobs: DiagnosticsJobs
+  knowledge: DiagnosticsKnowledge
+  model_speeds: DiagnosticsModelSpeed[]
+  recent_errors: DiagnosticsError[]
+  copy_summary: string
+}
+
 export type SearchSnippetPart = {
   text: string
   is_match: boolean
@@ -350,6 +413,7 @@ const commands = {
   listJobs: 'list_jobs',
   cancelJob: 'cancel_job',
   getDatabaseDiagnostics: 'get_database_diagnostics',
+  getDiagnosticsCenter: 'get_diagnostics_center',
   searchConversations: 'search_conversations',
   getConversationSummary: 'get_conversation_summary',
   saveConversationSummary: 'save_conversation_summary',
@@ -406,6 +470,12 @@ export function cancelJob(jobId: string) {
 
 export function getDatabaseDiagnostics() {
   return invoke<DatabaseDiagnostics>(commands.getDatabaseDiagnostics)
+}
+
+export function getDiagnosticsCenter(selectedModel?: string) {
+  return invoke<DiagnosticsCenter>(commands.getDiagnosticsCenter, {
+    selectedModel: selectedModel?.trim() || null,
+  })
 }
 
 export function searchConversations(query: string, limit = 30) {

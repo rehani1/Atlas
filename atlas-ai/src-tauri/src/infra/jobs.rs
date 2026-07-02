@@ -173,6 +173,70 @@ pub(crate) fn list_recent(conn: &Connection, limit: i64) -> Result<Vec<Job>, rus
     Ok(jobs)
 }
 
+pub(crate) fn list_active(conn: &Connection, limit: i64) -> Result<Vec<Job>, rusqlite::Error> {
+    let limit = limit.clamp(1, 50);
+    let mut statement = conn.prepare(
+        "
+      SELECT
+        id,
+        job_type,
+        status,
+        progress_current,
+        progress_total,
+        label,
+        payload_json,
+        result_json,
+        error_message,
+        created_at,
+        started_at,
+        completed_at,
+        cancelled_at
+      FROM jobs
+      WHERE status IN ('queued', 'running', 'cancelling')
+      ORDER BY created_at DESC
+      LIMIT ?1
+      ",
+    )?;
+
+    let jobs = statement
+        .query_map(params![limit], read_job)?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(jobs)
+}
+
+pub(crate) fn list_failed(conn: &Connection, limit: i64) -> Result<Vec<Job>, rusqlite::Error> {
+    let limit = limit.clamp(1, 50);
+    let mut statement = conn.prepare(
+        "
+      SELECT
+        id,
+        job_type,
+        status,
+        progress_current,
+        progress_total,
+        label,
+        payload_json,
+        result_json,
+        error_message,
+        created_at,
+        started_at,
+        completed_at,
+        cancelled_at
+      FROM jobs
+      WHERE status = 'failed'
+      ORDER BY COALESCE(completed_at, created_at) DESC
+      LIMIT ?1
+      ",
+    )?;
+
+    let jobs = statement
+        .query_map(params![limit], read_job)?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(jobs)
+}
+
 pub(crate) fn mark_interrupted(conn: &Connection, now: i64) -> Result<usize, rusqlite::Error> {
     conn.execute(
         "
