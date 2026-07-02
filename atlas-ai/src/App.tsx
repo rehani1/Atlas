@@ -4,6 +4,8 @@ import {
   deleteOllamaModel,
   downloadOllamaModel,
   getOllamaStatus,
+  type ChatMessage,
+  type GenerationRun,
   type OllamaModel,
   type OllamaStatus,
 } from './shared/api/tauri'
@@ -18,14 +20,6 @@ type ChatSummary = {
   created_at: number
   updated_at: number
   message_count: number
-}
-
-type ChatMessage = {
-  id: number
-  chat_id: string
-  role: 'user' | 'assistant' | 'system'
-  content: string
-  created_at: number
 }
 
 type UiError = {
@@ -71,6 +65,86 @@ function formatModelSize(size: number) {
   }
 
   return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`
+}
+
+function formatDurationMs(durationMs: number | null | undefined) {
+  if (durationMs === null || durationMs === undefined) {
+    return null
+  }
+
+  if (durationMs < 1000) {
+    return `${durationMs} ms`
+  }
+
+  const seconds = durationMs / 1000
+  return `${seconds.toFixed(seconds < 10 ? 2 : 1)} s`
+}
+
+function formatCount(count: number | null | undefined) {
+  return count === null || count === undefined ? null : count.toLocaleString()
+}
+
+function formatTokensPerSecond(value: number | null | undefined) {
+  return value === null || value === undefined ? null : `${value.toFixed(1)} tok/s`
+}
+
+function getTimeToFirstToken(run: GenerationRun) {
+  if (run.first_token_at === null) {
+    return null
+  }
+
+  return Math.max(0, run.first_token_at - run.started_at)
+}
+
+function generationStatusLabel(status: GenerationRun['status']) {
+  switch (status) {
+    case 'completed':
+      return 'Completed'
+    case 'cancelled':
+      return 'Cancelled'
+    case 'failed':
+      return 'Failed'
+    case 'running':
+      return 'Running'
+  }
+}
+
+function MessageDiagnostics({ run }: { run: GenerationRun | null }) {
+  if (!run) {
+    return null
+  }
+
+  const metrics = [
+    ['Model', run.model_name],
+    ['Status', generationStatusLabel(run.status)],
+    ['Total', formatDurationMs(run.total_duration_ms)],
+    ['First token', formatDurationMs(getTimeToFirstToken(run))],
+    ['Prompt', formatCount(run.prompt_eval_count)],
+    ['Completion', formatCount(run.eval_count)],
+    ['Speed', formatTokensPerSecond(run.tokens_per_second)],
+    ['Load', formatDurationMs(run.load_duration_ms)],
+  ].filter((metric): metric is [string, string] => metric[1] !== null)
+
+  return (
+    <details className="mt-3 border-t border-zinc-800/80 pt-2 text-xs text-zinc-500">
+      <summary className="cursor-pointer text-zinc-400">
+        {run.status === 'completed'
+          ? 'Details'
+          : generationStatusLabel(run.status)}
+      </summary>
+      <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1">
+        {metrics.map(([label, value]) => (
+          <div className="min-w-0" key={label}>
+            <dt className="text-zinc-600">{label}</dt>
+            <dd className="truncate text-zinc-300">{value}</dd>
+          </div>
+        ))}
+      </dl>
+      {run.error_message ? (
+        <p className="mt-2 break-words text-zinc-400">{run.error_message}</p>
+      ) : null}
+    </details>
+  )
 }
 
 function buildOllamaStatusFromModels(
@@ -650,6 +724,7 @@ function App() {
         role: 'user',
         content,
         created_at: Date.now(),
+        generation_run: null,
       }
       setMessages((currentMessages) => [...currentMessages, message])
       setDraft('')
@@ -1175,7 +1250,10 @@ function App() {
                 }`}
                 key={message.id}
               >
-                {message.content}
+                <div>{message.content}</div>
+                {message.role === 'assistant' ? (
+                  <MessageDiagnostics run={message.generation_run} />
+                ) : null}
               </article>
             ))}
 

@@ -5,6 +5,34 @@ export type OllamaModel = {
   size: number
 }
 
+export type GenerationRun = {
+  id: string
+  conversation_id: string
+  message_id: number | null
+  model_name: string
+  started_at: number
+  first_token_at: number | null
+  completed_at: number | null
+  status: 'running' | 'completed' | 'cancelled' | 'failed'
+  total_duration_ms: number | null
+  load_duration_ms: number | null
+  prompt_eval_count: number | null
+  prompt_eval_duration_ms: number | null
+  eval_count: number | null
+  eval_duration_ms: number | null
+  tokens_per_second: number | null
+  error_message: string | null
+}
+
+export type ChatMessage = {
+  id: number
+  chat_id: string
+  role: 'user' | 'assistant' | 'system'
+  content: string
+  created_at: number
+  generation_run: GenerationRun | null
+}
+
 export type OllamaStatusKind =
   | 'unavailable'
   | 'running_with_models'

@@ -108,6 +108,25 @@ ChatMessage
 - role: "user" | "assistant" | "system"
 - content: string
 - created_at: number
+- generation_run: GenerationRun | null
+
+GenerationRun
+- id: string
+- conversation_id: string
+- message_id: number | null
+- model_name: string
+- started_at: number
+- first_token_at: number | null
+- completed_at: number | null
+- status: "running" | "completed" | "cancelled" | "failed"
+- total_duration_ms: number | null
+- load_duration_ms: number | null
+- prompt_eval_count: number | null
+- prompt_eval_duration_ms: number | null
+- eval_count: number | null
+- eval_duration_ms: number | null
+- tokens_per_second: number | null
+- error_message: string | null
 
 OllamaModel
 - name: string
@@ -157,6 +176,25 @@ CREATE TABLE IF NOT EXISTS messages (
   content TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS generation_runs (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+  model_name TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  first_token_at INTEGER,
+  completed_at INTEGER,
+  status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'cancelled', 'failed')),
+  total_duration_ms INTEGER,
+  load_duration_ms INTEGER,
+  prompt_eval_count INTEGER,
+  prompt_eval_duration_ms INTEGER,
+  eval_count INTEGER,
+  eval_duration_ms INTEGER,
+  tokens_per_second REAL,
+  error_message TEXT
+);
 ```
 
 Current indexes and trigger:
@@ -167,6 +205,13 @@ CREATE INDEX IF NOT EXISTS idx_chats_updated_at
 
 CREATE INDEX IF NOT EXISTS idx_messages_chat_id_created_at
   ON messages(chat_id, created_at, id);
+
+CREATE INDEX IF NOT EXISTS idx_generation_runs_conversation_started
+  ON generation_runs(conversation_id, started_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_generation_runs_message_id
+  ON generation_runs(message_id)
+  WHERE message_id IS NOT NULL;
 
 CREATE TRIGGER IF NOT EXISTS messages_after_insert_update_chat
 AFTER INSERT ON messages
@@ -187,6 +232,9 @@ Persistence behavior:
 - Chat deletion relies on `ON DELETE CASCADE` to remove messages.
 - Chat lists sort by `chats.updated_at DESC`.
 - Message lists sort by `created_at ASC, id ASC`.
+- `generation_runs` rows are created before generation starts and are finalized
+  with completed, cancelled, or failed status.
+- Assistant messages expose at most one associated generation run.
 - WAL mode is not configured yet.
 
 ## Chat Generation Flow
@@ -211,14 +259,19 @@ The backend generation path:
 1. Validates the model name.
 2. Loads all messages for the chat from SQLite.
 3. Converts them to Ollama chat messages.
-4. Registers a cancellation flag in `GenerationTasks` keyed by `chat_id`.
-5. Runs blocking Ollama streaming work on Tauri's blocking runtime.
-6. Calls `POST http://127.0.0.1:11434/api/chat` with `stream: true`.
-7. Reads Ollama JSONL chunks and accumulates `message.content`.
-8. Returns an error if cancellation is requested, the request fails, JSON cannot
-   be parsed, or the final assistant content is empty.
-9. Inserts one final assistant message into SQLite only after a successful full
-   response.
+4. Creates a `generation_runs` row with status `running`.
+5. Registers a cancellation flag in `GenerationTasks` keyed by `chat_id`.
+6. Runs blocking Ollama streaming work on Tauri's blocking runtime.
+7. Calls `POST http://127.0.0.1:11434/api/chat` with `stream: true`.
+8. Reads Ollama JSONL chunks, accumulates `message.content`, tracks first
+   non-empty token time, and captures optional final Ollama metadata:
+   `total_duration`, `load_duration`, `prompt_eval_count`,
+   `prompt_eval_duration`, `eval_count`, and `eval_duration`.
+9. Converts Ollama nanosecond durations into rounded milliseconds and calculates
+   tokens/sec from `eval_count / eval_duration`.
+10. Inserts an assistant message and associates it with the generation run when
+    final or partial assistant text exists.
+11. Finalizes the generation run as `completed`, `cancelled`, or `failed`.
 
 Important current limitation: chat is streamed from Ollama to Rust, but not
 token-streamed from Rust to React. React shows animated progress dots while
@@ -235,12 +288,14 @@ by `chat_id`.
   cancelled.
 - `stream_ollama_chat()` checks the flag before each blocking `read_line()`.
 - After the blocking generation future resolves, the command removes the task
-  entry for that chat.
+  entry for that chat only if it still owns the same cancellation flag.
 - Cancellation is scoped by chat ID, so cancelling one chat does not directly
   cancel another chat.
 
-Current limitation: cancellation may not be immediate while a blocking read is
-stalled, and partial assistant content is not persisted on cancellation.
+Cancellation with partial assistant text now persists that partial text as an
+assistant message and marks its generation run `cancelled`. Current limitation:
+cancellation may not be immediate while a blocking read is stalled, and
+cancellation before the first token still leaves no assistant message.
 
 ## Model Management Flow
 
@@ -295,6 +350,7 @@ Current limitations:
 - Current chat messages.
 - Composer draft.
 - Chat/history errors.
+- Optional assistant-message generation run details.
 - Ollama readiness status and readiness loading state.
 - Ollama models and selected model.
 - Model panel visibility and model action state.
@@ -335,6 +391,8 @@ Current user-visible error surfaces:
 - `chatSearchError` for search-specific failures.
 - Readiness notices for Ollama offline, no local models, selected model missing,
   and browser preview.
+- Per-message generation details for assistant messages with associated
+  `generation_run` metadata.
 
 Ollama connection failures are normalized to:
 
@@ -363,17 +421,18 @@ The frontend suppresses that cancellation message in the active chat error UI.
   assembly layer or context diagnostics.
 - The generation task registry is in-memory and keyed only by chat ID.
 - Cancellation depends on checking a flag between blocking stream reads.
-- No final Ollama metadata is parsed or stored.
-- Partial assistant output is dropped on cancellation or failure.
+- Failed runs with no assistant text are persisted but only surface as inline
+  `historyError` in the current UI.
 - Model downloads have no progress or cancellation path.
 - Search uses `LIKE`, so result quality and scalability are limited.
 - Raw error strings are shown directly in most UI surfaces.
 
 ## Verification Notes
 
-The baseline and first-run chunks intentionally preserve existing chat
-generation, persistence, cancellation, search, and model lifecycle command names.
-No schema or Tauri permission changes have been added yet.
+The baseline, first-run, and message-diagnostics chunks intentionally preserve
+existing chat, search, and model lifecycle command names. Chunk 2 adds the
+repeatable `generation_runs` schema extension. No Tauri permission changes have
+been added yet.
 
 Relevant checks:
 
