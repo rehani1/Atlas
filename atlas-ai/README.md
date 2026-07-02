@@ -3,7 +3,7 @@
 Atlas is a local-first desktop chat app built with Tauri, Rust, React, Vite,
 Tailwind CSS, SQLite, and Ollama.
 
-Version `1.0.0` provides a barebones interface for running local
+Version `1.1.0` provides a local-first interface for running local
 models, keeping chat history on the device, and managing downloaded Ollama
 models without a hosted backend.
 
@@ -86,6 +86,6 @@ downloads, and deletions use local API calls. Chat responses are streamed from
 
 ## Release
 
-This repository is prepared for Atlas `1.0.0`.
+This repository is prepared for Atlas `1.1.0`.
 
 See `CHANGELOG.md` for release notes.

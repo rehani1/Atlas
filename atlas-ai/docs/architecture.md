@@ -2,7 +2,7 @@
 
 Last audited: 2026-07-02
 
-This document records the current Atlas `1.0.0` architecture during the remake
+This document records the current Atlas `1.1.0` architecture during the remake
 chunks. It is descriptive, not the target architecture.
 
 ## Scope

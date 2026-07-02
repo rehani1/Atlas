@@ -4167,7 +4167,7 @@ mod tests {
         let diagnostics = diagnostics_service::collect(
             &conn,
             diagnostics_service::DiagnosticsInput {
-                app_version: "1.0.0-test",
+                app_version: "1.1.0-test",
                 generated_at: 250,
                 database_path: std::path::Path::new("/Users/rehan/private/atlas.sqlite3"),
                 ollama: build_ollama_status(
@@ -4179,7 +4179,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(diagnostics.app_version, "1.0.0-test");
+        assert_eq!(diagnostics.app_version, "1.1.0-test");
         assert_eq!(diagnostics.knowledge.indexed_document_count, 1);
         assert_eq!(diagnostics.knowledge.chunk_count, 1);
         assert_eq!(diagnostics.jobs.recent_failed.len(), 1);

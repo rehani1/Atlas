@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.0 - 2026-07-02
+
+Current local-first Atlas release.
+
 ## 1.0.0 - 2026-06-03
 
 Initial stable release of Atlas.
