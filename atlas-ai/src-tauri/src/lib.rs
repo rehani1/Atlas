@@ -3,17 +3,19 @@ mod domain;
 mod infra;
 
 use app::{
-    benchmarks as benchmark_service, jobs as job_service, models as model_service,
-    summaries as summary_service,
+    benchmarks as benchmark_service, jobs as job_service, memories as memory_service,
+    models as model_service, summaries as summary_service,
 };
 use domain::benchmark::{ModelBenchmark, ModelUsage};
 use domain::database::DatabaseDiagnostics;
 use domain::job::{Job, JobEvent, JobStatus, JobType};
+use domain::memory::{Memory, MemoryPromptSetting, MemoryScopeType, PromptMemoryUse};
 use domain::model::{validate_ollama_model_name, OllamaModel, OllamaStatus};
 use domain::search::ChatSearchResult;
 use domain::summary::{ConversationSummary, SummarySourceMessage};
 use infra::{
-    benchmarks::CompletedBenchmarkMetrics, jobs as job_repository, ollama, search, sqlite,
+    benchmarks::CompletedBenchmarkMetrics, jobs as job_repository, memories as memory_repository,
+    ollama, search, sqlite,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
@@ -92,6 +94,7 @@ struct GenerationRun {
     eval_duration_ms: Option<i64>,
     tokens_per_second: Option<f64>,
     error_message: Option<String>,
+    memory_uses: Vec<PromptMemoryUse>,
 }
 
 #[derive(Copy, Clone, Debug, Deserialize, PartialEq)]
@@ -589,6 +592,39 @@ fn summary_prompt_context(summary: &ConversationSummary) -> OllamaChatMessage {
                 .map_or_else(|| "unknown".to_string(), |id| id.to_string()),
             summary.summary
         ),
+    }
+}
+
+fn memory_prompt_context(memories: &[Memory]) -> OllamaChatMessage {
+    let mut content = String::from(
+        "The user enabled these Atlas memories for this chat. Treat them as user-owned context, not hidden model memory. Use them only when relevant, and do not invent additional memories.\n\n",
+    );
+
+    for (index, memory) in memories.iter().enumerate() {
+        let scope = match memory.scope_type {
+            MemoryScopeType::Global => "global".to_string(),
+            MemoryScopeType::Conversation => memory.scope_id.as_ref().map_or_else(
+                || "conversation".to_string(),
+                |scope_id| format!("conversation:{scope_id}"),
+            ),
+            MemoryScopeType::Project => memory.scope_id.as_ref().map_or_else(
+                || "project".to_string(),
+                |scope_id| format!("project:{scope_id}"),
+            ),
+        };
+        let pinned = if memory.pinned { " pinned" } else { "" };
+        content.push_str(&format!(
+            "{}. [{}{}] {}\n",
+            index + 1,
+            scope,
+            pinned,
+            memory.content
+        ));
+    }
+
+    OllamaChatMessage {
+        role: "system".to_string(),
+        content,
     }
 }
 
@@ -1202,6 +1238,7 @@ fn read_generation_run(
             eval_duration_ms: row.get(offset + 13)?,
             tokens_per_second: row.get(offset + 14)?,
             error_message: row.get(offset + 15)?,
+            memory_uses: Vec::new(),
         }),
         None => None,
     })
@@ -1434,9 +1471,15 @@ fn list_messages_for_chat(
     ",
     )?;
 
-    let messages = statement
+    let mut messages = statement
         .query_map(params![chat_id], read_chat_message_with_generation_run)?
         .collect::<Result<Vec<_>, _>>()?;
+
+    for message in &mut messages {
+        if let Some(run) = &mut message.generation_run {
+            run.memory_uses = memory_repository::list_generation_uses(conn, &run.id)?;
+        }
+    }
 
     Ok(messages)
 }
@@ -1500,6 +1543,7 @@ fn read_generation_run_required(row: &Row<'_>) -> Result<GenerationRun, rusqlite
         eval_duration_ms: row.get(13)?,
         tokens_per_second: row.get(14)?,
         error_message: row.get(15)?,
+        memory_uses: Vec::new(),
     })
 }
 
@@ -1596,6 +1640,52 @@ fn update_generation_run(
         read_generation_run_required,
     )
     .map_err(|error| error.to_string())
+}
+
+fn require_chat(conn: &Connection, chat_id: &str) -> Result<(), String> {
+    get_chat_summary(conn, chat_id)
+        .map_err(|error| error.to_string())?
+        .map(|_| ())
+        .ok_or_else(|| "Chat was not found".to_string())
+}
+
+fn resolve_memory_source(
+    conn: &Connection,
+    source_conversation_id: Option<String>,
+    source_message_id: Option<i64>,
+) -> Result<(Option<String>, Option<i64>), String> {
+    let source_conversation_id = source_conversation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    if let Some(source_message_id) = source_message_id {
+        let message_chat_id = conn
+            .query_row(
+                "SELECT chat_id FROM messages WHERE id = ?1",
+                params![source_message_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Source message was not found".to_string())?;
+
+        if let Some(source_conversation_id) = &source_conversation_id {
+            if source_conversation_id != &message_chat_id {
+                return Err("Source message does not belong to that chat.".to_string());
+            }
+        }
+
+        return Ok((Some(message_chat_id), Some(source_message_id)));
+    }
+
+    if let Some(source_conversation_id) = source_conversation_id {
+        require_chat(conn, &source_conversation_id)?;
+        return Ok((Some(source_conversation_id), None));
+    }
+
+    Ok((None, None))
 }
 
 #[tauri::command]
@@ -1778,6 +1868,129 @@ fn delete_conversation_summary(
         .lock()
         .map_err(|_| "Database lock was poisoned".to_string())?;
     summary_service::delete(&conn, &chat_id)
+}
+
+#[tauri::command]
+fn list_memories(
+    store: State<'_, ChatStore>,
+    include_archived: Option<bool>,
+) -> Result<Vec<Memory>, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    memory_service::list(&conn, include_archived.unwrap_or(false))
+}
+
+#[tauri::command]
+fn create_memory(
+    store: State<'_, ChatStore>,
+    scope_type: MemoryScopeType,
+    scope_id: Option<String>,
+    content: String,
+    source_conversation_id: Option<String>,
+    source_message_id: Option<i64>,
+    pinned: bool,
+) -> Result<Memory, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    let normalized_scope_id = scope_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    if matches!(scope_type, MemoryScopeType::Conversation) {
+        let scope_id = normalized_scope_id
+            .as_deref()
+            .ok_or_else(|| "Conversation memories require a chat.".to_string())?;
+        require_chat(&conn, scope_id)?;
+    }
+
+    let (source_conversation_id, source_message_id) =
+        resolve_memory_source(&conn, source_conversation_id, source_message_id)?;
+    memory_service::create(
+        &conn,
+        memory_service::CreateMemory {
+            scope_type,
+            scope_id: normalized_scope_id.as_deref(),
+            content: &content,
+            source_conversation_id: source_conversation_id.as_deref(),
+            source_message_id,
+            pinned,
+            now: now_millis()?,
+        },
+    )
+}
+
+#[tauri::command]
+fn update_memory(
+    store: State<'_, ChatStore>,
+    memory_id: String,
+    content: String,
+    pinned: bool,
+) -> Result<Memory, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    memory_service::update(&conn, &memory_id, &content, pinned, now_millis()?)
+}
+
+#[tauri::command]
+fn archive_memory(store: State<'_, ChatStore>, memory_id: String) -> Result<Memory, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    memory_service::archive(&conn, &memory_id, now_millis()?)
+}
+
+#[tauri::command]
+fn restore_memory(store: State<'_, ChatStore>, memory_id: String) -> Result<Memory, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    memory_service::restore(&conn, &memory_id, now_millis()?)
+}
+
+#[tauri::command]
+fn delete_memory(store: State<'_, ChatStore>, memory_id: String) -> Result<bool, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    memory_service::delete(&conn, &memory_id)
+}
+
+#[tauri::command]
+fn get_memory_prompt_setting(
+    store: State<'_, ChatStore>,
+    chat_id: String,
+) -> Result<MemoryPromptSetting, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    require_chat(&conn, &chat_id)?;
+    memory_service::prompt_setting(&conn, &chat_id)
+}
+
+#[tauri::command]
+fn set_memory_prompt_enabled(
+    store: State<'_, ChatStore>,
+    chat_id: String,
+    enabled_for_prompt: bool,
+) -> Result<MemoryPromptSetting, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    require_chat(&conn, &chat_id)?;
+    memory_service::set_prompt_enabled(&conn, &chat_id, enabled_for_prompt, now_millis()?)
 }
 
 #[tauri::command]
@@ -2323,7 +2536,7 @@ async fn generate_assistant_response(
 ) -> Result<ChatMessage, String> {
     let model = validate_ollama_model_name(&model)?;
     let started_at = now_millis()?;
-    let (messages, prompt_summary) = {
+    let (messages, prompt_summary, prompt_memories) = {
         let conn = store
             .conn
             .lock()
@@ -2336,7 +2549,13 @@ async fn generate_assistant_response(
         }
 
         let prompt_summary = summary_service::get_enabled_for_prompt(&conn, &chat_id)?;
-        (messages, prompt_summary)
+        let memory_setting = memory_service::prompt_setting(&conn, &chat_id)?;
+        let prompt_memories = if memory_setting.enabled_for_prompt {
+            memory_service::prompt_memories(&conn, &chat_id)?
+        } else {
+            Vec::new()
+        };
+        (messages, prompt_summary, prompt_memories)
     };
     let run_id = {
         let conn = store
@@ -2345,10 +2564,25 @@ async fn generate_assistant_response(
             .map_err(|_| "Database lock was poisoned".to_string())?;
         create_generation_run(&conn, &chat_id, &model, started_at)?
     };
-    let mut ollama_messages =
-        Vec::with_capacity(messages.len() + usize::from(prompt_summary.is_some()));
+    let memory_uses = if prompt_memories.is_empty() {
+        Vec::new()
+    } else {
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        memory_service::record_generation_uses(&conn, &run_id, &prompt_memories, started_at)?
+    };
+    let mut ollama_messages = Vec::with_capacity(
+        messages.len()
+            + usize::from(prompt_summary.is_some())
+            + usize::from(!prompt_memories.is_empty()),
+    );
     if let Some(summary) = prompt_summary {
         ollama_messages.push(summary_prompt_context(&summary));
+    }
+    if !prompt_memories.is_empty() {
+        ollama_messages.push(memory_prompt_context(&prompt_memories));
     }
     ollama_messages.extend(messages.into_iter().map(|message| OllamaChatMessage {
         role: message.role,
@@ -2418,7 +2652,8 @@ async fn generate_assistant_response(
                 .lock()
                 .map_err(|_| "Database lock was poisoned".to_string())?;
             let mut message = insert_message(&conn, &chat_id, "assistant", &result.content)?;
-            let run = update_generation_run(&conn, &run_id, Some(message.id), &completion)?;
+            let mut run = update_generation_run(&conn, &run_id, Some(message.id), &completion)?;
+            run.memory_uses = memory_uses;
             message.generation_run = Some(run);
             Ok(message)
         }
@@ -2465,7 +2700,10 @@ async fn generate_assistant_response(
                 }
             };
             let run = match update_generation_run(&conn, &run_id, Some(message.id), &completion) {
-                Ok(run) => run,
+                Ok(mut run) => {
+                    run.memory_uses = memory_uses;
+                    run
+                }
                 Err(update_error) => {
                     if error.cancelled {
                         return Err("Generation cancelled".to_string());
@@ -2523,6 +2761,14 @@ pub fn run() {
             save_conversation_summary,
             set_conversation_summary_enabled,
             delete_conversation_summary,
+            list_memories,
+            create_memory,
+            update_memory,
+            archive_memory,
+            restore_memory,
+            delete_memory,
+            get_memory_prompt_setting,
+            set_memory_prompt_enabled,
             add_message,
             delete_chat,
             export_chat,
@@ -2553,22 +2799,24 @@ mod tests {
     };
 
     use super::app::{
-        benchmarks as benchmark_service, jobs as job_service, summaries as summary_service,
+        benchmarks as benchmark_service, jobs as job_service, memories as memory_service,
+        summaries as summary_service,
     };
     use super::domain::benchmark::ModelBenchmarkStatus;
     use super::domain::job::{JobStatus, JobType};
+    use super::domain::memory::MemoryScopeType;
     use super::domain::model::{
         build_ollama_status, validate_ollama_model_name, OllamaModel, OllamaStatusKind,
     };
     use super::domain::search::SearchResultSource;
     use super::infra::{
         benchmarks::{self as benchmark_repository, CompletedBenchmarkMetrics},
-        jobs as job_repository, search, sqlite,
+        jobs as job_repository, memories as memory_repository, search, sqlite,
     };
     use super::{
-        calculate_tokens_per_second, escape_like_pattern, format_timestamp_ms, nanos_to_millis,
-        normalize_title, render_chat_export, sanitize_file_name, ChatExportFormat, ChatMessage,
-        ChatSummary, GenerationRun,
+        calculate_tokens_per_second, create_generation_run, escape_like_pattern,
+        format_timestamp_ms, nanos_to_millis, normalize_title, render_chat_export,
+        sanitize_file_name, ChatExportFormat, ChatMessage, ChatSummary, GenerationRun,
     };
 
     fn test_model(name: &str) -> OllamaModel {
@@ -2705,6 +2953,7 @@ mod tests {
                     eval_duration_ms: Some(100),
                     tokens_per_second: Some(60.0),
                     error_message: Some("Generation failed".to_string()),
+                    memory_uses: Vec::new(),
                 }),
             },
         ];
@@ -2905,6 +3154,78 @@ mod tests {
     }
 
     #[test]
+    fn memory_service_persists_user_owned_prompt_context() {
+        let conn = Connection::open_in_memory().unwrap();
+        sqlite::setup_database(&conn).unwrap();
+        conn.execute(
+            "
+            INSERT INTO chats (id, title, created_at, updated_at)
+            VALUES ('chat-1', 'Memory Check', 100, 100)
+            ",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "
+            INSERT INTO messages (chat_id, role, content, created_at)
+            VALUES ('chat-1', 'user', 'Remember that I prefer local-only storage.', 125)
+            ",
+            [],
+        )
+        .unwrap();
+
+        let memory = memory_service::create(
+            &conn,
+            memory_service::CreateMemory {
+                scope_type: MemoryScopeType::Conversation,
+                scope_id: Some("chat-1"),
+                content: "User prefers local-only storage.",
+                source_conversation_id: Some("chat-1"),
+                source_message_id: Some(1),
+                pinned: true,
+                now: 150,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(memory.scope_type, MemoryScopeType::Conversation);
+        assert_eq!(memory.scope_id.as_deref(), Some("chat-1"));
+        assert_eq!(memory.source_message_id, Some(1));
+        assert!(memory.pinned);
+
+        let default_setting = memory_service::prompt_setting(&conn, "chat-1").unwrap();
+        assert!(!default_setting.enabled_for_prompt);
+
+        let setting = memory_service::set_prompt_enabled(&conn, "chat-1", true, 175).unwrap();
+        assert!(setting.enabled_for_prompt);
+
+        let prompt_memories = memory_service::prompt_memories(&conn, "chat-1").unwrap();
+        assert_eq!(prompt_memories.len(), 1);
+        assert_eq!(prompt_memories[0].id, memory.id);
+
+        let run_id = create_generation_run(&conn, "chat-1", "llama3.2:3b", 200).unwrap();
+        let uses =
+            memory_service::record_generation_uses(&conn, &run_id, &prompt_memories, 200).unwrap();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].memory_id.as_deref(), Some(memory.id.as_str()));
+        assert_eq!(uses[0].content, "User prefers local-only storage.");
+
+        let listed_uses = memory_repository::list_generation_uses(&conn, &run_id).unwrap();
+        assert_eq!(listed_uses.len(), 1);
+        assert_eq!(listed_uses[0].source_message_id, Some(1));
+
+        let archived = memory_service::archive(&conn, &memory.id, 225).unwrap();
+        assert_eq!(archived.archived_at, Some(225));
+        assert!(memory_service::prompt_memories(&conn, "chat-1")
+            .unwrap()
+            .is_empty());
+
+        let restored = memory_service::restore(&conn, &memory.id, 250).unwrap();
+        assert!(restored.archived_at.is_none());
+        assert!(memory_service::delete(&conn, &memory.id).unwrap());
+    }
+
+    #[test]
     fn sqlite_setup_enables_wal_and_reports_safe_diagnostics() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2916,7 +3237,7 @@ mod tests {
         sqlite::setup_database(&conn).unwrap();
         let diagnostics = sqlite::diagnostics(&conn, &db_path).unwrap();
 
-        assert_eq!(diagnostics.user_version, 4);
+        assert_eq!(diagnostics.user_version, 5);
         assert_eq!(diagnostics.journal_mode, "wal");
         assert_eq!(diagnostics.integrity_check, "ok");
         assert!(diagnostics
@@ -2935,6 +3256,18 @@ mod tests {
             .table_counts
             .iter()
             .any(|table| { table.table_name == "conversation_summaries" && table.row_count == 0 }));
+        assert!(diagnostics
+            .table_counts
+            .iter()
+            .any(|table| table.table_name == "memories" && table.row_count == 0));
+        assert!(diagnostics
+            .table_counts
+            .iter()
+            .any(|table| { table.table_name == "memory_prompt_settings" && table.row_count == 0 }));
+        assert!(diagnostics
+            .table_counts
+            .iter()
+            .any(|table| { table.table_name == "generation_memory_uses" && table.row_count == 0 }));
 
         drop(conn);
         let _ = fs::remove_file(&db_path);

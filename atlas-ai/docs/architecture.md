@@ -14,22 +14,25 @@ Tailwind CSS, SQLite, and Ollama. The current codebase is intentionally compact:
 - Most backend state, SQLite repositories, command handlers, streaming, and
   cancellation still live in `src-tauri/src/lib.rs`.
 - Backend service slices now include model management, jobs, database
-  setup/diagnostics, FTS search, and model benchmarks:
+  setup/diagnostics, FTS search, model benchmarks, summaries, and memories:
   `src-tauri/src/domain/model.rs`, `src-tauri/src/app/models.rs`,
   `src-tauri/src/domain/job.rs`, `src-tauri/src/app/jobs.rs`,
   `src-tauri/src/domain/benchmark.rs`, `src-tauri/src/app/benchmarks.rs`,
+  `src-tauri/src/domain/summary.rs`, `src-tauri/src/app/summaries.rs`,
+  `src-tauri/src/domain/memory.rs`, `src-tauri/src/app/memories.rs`,
   `src-tauri/src/infra/jobs.rs`, `src-tauri/src/domain/database.rs`,
   `src-tauri/src/domain/search.rs`, `src-tauri/src/infra/search.rs`,
-  `src-tauri/src/infra/benchmarks.rs`, `src-tauri/src/infra/sqlite.rs`, and
+  `src-tauri/src/infra/benchmarks.rs`, `src-tauri/src/infra/summaries.rs`,
+  `src-tauri/src/infra/memories.rs`, `src-tauri/src/infra/sqlite.rs`, and
   `src-tauri/src/infra/ollama.rs`.
 - `src-tauri/src/main.rs` only starts `atlas_lib::run()`.
 - Public release docs are `README.md` and `CHANGELOG.md`.
 
 There is a minimal typed frontend API wrapper for touched Ollama status, model
-lifecycle, export, jobs, database diagnostics, and rich search commands in
-`src/shared/api/tauri.ts`. There are no frontend feature folders, Rust
-`commands` module, database migrations directory, document indexing, memory, or
-import surfaces yet.
+lifecycle, export, jobs, database diagnostics, rich search, summaries, memory,
+and benchmark commands in `src/shared/api/tauri.ts`. There are no frontend
+feature folders, Rust `commands` module, database migrations directory,
+document indexing, or import surfaces yet.
 
 `src/App.tsx` now also owns a small frontend-only command registry and
 `Cmd/Ctrl+K` command palette. The registry uses stable command IDs and routes
@@ -63,7 +66,7 @@ Current Tauri permissions are limited to `core:default` in
 Rust owns privileged operations:
 
 - SQLite connection, schema setup, diagnostics, FTS search, benchmark storage,
-  and queries.
+  memory storage, and queries.
 - Chat and message persistence.
 - Ollama readiness, model list, pull, delete, and chat requests.
 - Model name validation.
@@ -109,6 +112,14 @@ save_conversation_summary(chat_id: String, summary: String, enabled_for_prompt: 
 set_conversation_summary_enabled(chat_id: String, enabled_for_prompt: bool) -> ConversationSummary
 delete_conversation_summary(chat_id: String) -> bool
 generate_conversation_summary(chat_id: String, model: String) -> ConversationSummary
+list_memories(include_archived: Option<bool>) -> Vec<Memory>
+create_memory(scope_type: MemoryScopeType, scope_id: Option<String>, content: String, source_conversation_id: Option<String>, source_message_id: Option<i64>, pinned: bool) -> Memory
+update_memory(memory_id: String, content: String, pinned: bool) -> Memory
+archive_memory(memory_id: String) -> Memory
+restore_memory(memory_id: String) -> Memory
+delete_memory(memory_id: String) -> bool
+get_memory_prompt_setting(chat_id: String) -> MemoryPromptSetting
+set_memory_prompt_enabled(chat_id: String, enabled_for_prompt: bool) -> MemoryPromptSetting
 list_model_benchmarks(limit: Option<i64>) -> Vec<ModelBenchmark>
 list_model_usage() -> Vec<ModelUsage>
 cancel_job(job_id: String) -> Job
@@ -155,6 +166,7 @@ GenerationRun
 - eval_duration_ms: number | null
 - tokens_per_second: number | null
 - error_message: string | null
+- memory_uses: PromptMemoryUse[]
 
 ChatExportFormat
 - "markdown" | "json" | "plain_text"
@@ -239,6 +251,39 @@ ConversationSummary
 - created_at: number
 - updated_at: number
 
+MemoryScopeType
+- "global" | "conversation" | "project"
+
+Memory
+- id: string
+- scope_type: MemoryScopeType
+- scope_id: string | null
+- content: string
+- source_conversation_id: string | null
+- source_message_id: number | null
+- confidence: number | null
+- pinned: bool
+- archived_at: number | null
+- created_at: number
+- updated_at: number
+
+MemoryPromptSetting
+- conversation_id: string
+- enabled_for_prompt: bool
+- created_at: number
+- updated_at: number
+
+PromptMemoryUse
+- id: string
+- generation_run_id: string
+- memory_id: string | null
+- content: string
+- scope_type: MemoryScopeType
+- scope_id: string | null
+- source_conversation_id: string | null
+- source_message_id: number | null
+- used_at: number
+
 ModelBenchmark
 - id: string
 - job_id: string
@@ -284,7 +329,8 @@ connection and runs repeatable baseline schema setup. The current
 version 1. Chunk 8 adds FTS search tables and records the current schema as
 version 2. Chunk 9 adds `model_benchmarks` and records the current schema as
 `PRAGMA user_version = 3`. Chunk 10 adds `conversation_summaries` and records
-the current schema as `PRAGMA user_version = 4`.
+the current schema as `PRAGMA user_version = 4`. Chunk 11 adds transparent
+memory tables and records the current schema as `PRAGMA user_version = 5`.
 
 There is no migrations directory yet. Future schema changes should add
 idempotent versions after the v1 baseline instead of editing historical setup in
@@ -426,6 +472,39 @@ CREATE TABLE IF NOT EXISTS conversation_summaries (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS memories (
+  id TEXT PRIMARY KEY,
+  scope_type TEXT NOT NULL CHECK(scope_type IN ('global', 'conversation', 'project')),
+  scope_id TEXT,
+  content TEXT NOT NULL,
+  source_conversation_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
+  source_message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+  confidence REAL,
+  pinned INTEGER NOT NULL DEFAULT 0 CHECK(pinned IN (0, 1)),
+  archived_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_prompt_settings (
+  conversation_id TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+  enabled_for_prompt INTEGER NOT NULL DEFAULT 0 CHECK(enabled_for_prompt IN (0, 1)),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS generation_memory_uses (
+  id TEXT PRIMARY KEY,
+  generation_run_id TEXT NOT NULL REFERENCES generation_runs(id) ON DELETE CASCADE,
+  memory_id TEXT REFERENCES memories(id) ON DELETE SET NULL,
+  content_snapshot TEXT NOT NULL,
+  scope_type TEXT NOT NULL CHECK(scope_type IN ('global', 'conversation', 'project')),
+  scope_id TEXT,
+  source_conversation_id TEXT,
+  source_message_id INTEGER,
+  used_at INTEGER NOT NULL
+);
 ```
 
 Current indexes and triggers:
@@ -464,6 +543,18 @@ CREATE INDEX IF NOT EXISTS idx_conversation_summaries_updated
 
 CREATE INDEX IF NOT EXISTS idx_conversation_summaries_enabled
   ON conversation_summaries(conversation_id, enabled_for_prompt);
+
+CREATE INDEX IF NOT EXISTS idx_memories_scope
+  ON memories(scope_type, scope_id, archived_at, pinned DESC, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_memories_updated
+  ON memories(archived_at, pinned DESC, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_memories_source_message
+  ON memories(source_message_id);
+
+CREATE INDEX IF NOT EXISTS idx_generation_memory_uses_run
+  ON generation_memory_uses(generation_run_id, used_at ASC);
 
 CREATE TRIGGER IF NOT EXISTS messages_after_insert_update_chat
 AFTER INSERT ON messages
@@ -509,6 +600,15 @@ Persistence behavior:
   message ID range, model name, monotonically increasing version, and an
   explicit `enabled_for_prompt` flag. New generated summaries default to prompt
   use off unless the user had already enabled the existing summary.
+- `memories` stores manual, user-owned memory rows with global, conversation,
+  or future project scope. The MVP never writes memory automatically. Source
+  chat/message IDs are stored only when the user explicitly creates memory from
+  a visible message or supplies a source.
+- `memory_prompt_settings` stores the per-chat memory inclusion switch. Missing
+  rows behave as disabled.
+- `generation_memory_uses` stores a snapshot of each memory included in a
+  prompt for a generation run so message diagnostics can show what was used
+  even if the memory is edited, archived, or forgotten later.
 - During startup, queued/running/cancelling jobs from a previous process are
   marked `failed` with an interruption message so stale jobs do not remain
   cancellable forever.
@@ -518,8 +618,9 @@ Persistence behavior:
 - WAL mode is enabled for the file-backed desktop database.
 - `get_database_diagnostics` reads the database path, database/WAL/SHM sizes,
   journal mode, schema user version, page counts, free pages, integrity check,
-  and table counts for core tables, FTS tables, benchmark tables, and summary
-  tables. It does not export chat content or mutate user data.
+  and table counts for core tables, FTS tables, benchmark tables, summary
+  tables, and memory tables. It does not export chat content or mutate user
+  data.
 
 ## Chat Generation Flow
 
@@ -537,9 +638,12 @@ The user flow starts in `src/App.tsx`:
 8. If the active conversation summary exists and `enabled_for_prompt` is true,
    the backend prepends it as an explicit system context block before the
    visible chat messages.
-9. When the command resolves, the frontend appends the assistant message only if
+9. If memory use is enabled for the chat, the backend loads active global and
+   conversation-scoped memories, snapshots them to `generation_memory_uses`,
+   and prepends them as an explicit system context block.
+10. When the command resolves, the frontend appends the assistant message only if
    the active chat still matches the generating chat.
-10. The frontend reloads messages and refreshes chat summaries.
+11. The frontend reloads messages and refreshes chat summaries.
 
 The backend generation path:
 
@@ -547,22 +651,26 @@ The backend generation path:
 2. Loads all messages for the chat from SQLite.
 3. Loads the enabled conversation summary, if the user has turned prompt use on
    for this chat.
-4. Converts the optional summary and all visible messages to Ollama chat
-   messages. The summary is inserted as a system message that states it was
-   user-enabled and transparent.
+4. Loads active prompt memories only if `memory_prompt_settings` is enabled for
+   this chat. Active prompt memories are unarchived global memories plus
+   unarchived conversation memories scoped to the chat.
 5. Creates a `generation_runs` row with status `running`.
-6. Registers a cancellation flag in `GenerationTasks` keyed by `chat_id`.
-7. Runs blocking Ollama streaming work on Tauri's blocking runtime.
-8. Calls `POST http://127.0.0.1:11434/api/chat` with `stream: true`.
-9. Reads Ollama JSONL chunks, accumulates `message.content`, tracks first
+6. Snapshots any prompt memories into `generation_memory_uses` for diagnostics.
+7. Converts the optional summary, optional memory context, and all visible
+   messages to Ollama chat messages. Summary and memory context blocks both
+   state that the user enabled them.
+8. Registers a cancellation flag in `GenerationTasks` keyed by `chat_id`.
+9. Runs blocking Ollama streaming work on Tauri's blocking runtime.
+10. Calls `POST http://127.0.0.1:11434/api/chat` with `stream: true`.
+11. Reads Ollama JSONL chunks, accumulates `message.content`, tracks first
    non-empty token time, and captures optional final Ollama metadata:
    `total_duration`, `load_duration`, `prompt_eval_count`,
    `prompt_eval_duration`, `eval_count`, and `eval_duration`.
-10. Converts Ollama nanosecond durations into rounded milliseconds and calculates
+12. Converts Ollama nanosecond durations into rounded milliseconds and calculates
    tokens/sec from `eval_count / eval_duration`.
-11. Inserts an assistant message and associates it with the generation run when
+13. Inserts an assistant message and associates it with the generation run when
     final or partial assistant text exists.
-12. Finalizes the generation run as `completed`, `cancelled`, or `failed`.
+14. Finalizes the generation run as `completed`, `cancelled`, or `failed`.
 
 Important current limitation: chat is streamed from Ollama to Rust, but not
 token-streamed from Rust to React. React shows animated progress dots while
@@ -594,6 +702,35 @@ Prompt use is off by default for a newly generated summary. If the user had
 already enabled a previous summary for that chat, generating an update preserves
 that setting. When enabled, the chat screen shows a visible "Summary context on"
 state and the summary action button is highlighted.
+
+## Memory Flow
+
+Memory is manual in the MVP:
+
+- `list_memories(include_archived)` returns stored user memories for the Memory
+  Inspector.
+- `create_memory(...)` writes only user-submitted memory content. It supports
+  `global` and `conversation` scope in the UI; `project` is reserved for future
+  workspaces.
+- Source message IDs are stored only when the user clicks `Remember` on a
+  visible message. The backend validates that the source message belongs to the
+  supplied source chat.
+- `update_memory`, `archive_memory`, `restore_memory`, and `delete_memory`
+  support edit, archive, restore, and forget actions from the inspector.
+- `get_memory_prompt_setting(chat_id)` returns a disabled setting when no row
+  exists. `set_memory_prompt_enabled(chat_id, enabled)` stores the visible
+  per-chat memory-use switch.
+
+Prompt inclusion is transparent:
+
+- Memory use defaults off for every chat.
+- When enabled, Atlas includes unarchived global memories and unarchived
+  conversation memories scoped to the active chat.
+- The active chat shows "Memory context on" and the active memory count.
+- Assistant message diagnostics show `generation_run.memory_uses`, which are
+  snapshots of the memories used for that prompt.
+- Archiving or forgetting a memory prevents future prompt inclusion. Existing
+  generation diagnostics keep the historical snapshot.
 
 ## Cancellation Flow
 
@@ -718,6 +855,8 @@ Current limitations:
 - Current chat messages.
 - Active conversation summary, editable summary draft, summary panel visibility,
   summary loading/action state, and summary errors.
+- Memory list, active chat memory prompt setting, Memory Inspector visibility,
+  memory form/edit/source state, memory loading/action state, and memory errors.
 - Composer draft.
 - Chat/history errors.
 - Optional assistant-message generation run details.
@@ -746,6 +885,8 @@ Existing stale-state guards:
 - Model benchmark terminal job events refresh Model Lab history and usage.
 - Conversation summary terminal job events refresh the active chat summary only
   when the job payload `chat_id` still matches the open chat.
+- Active chat memory prompt settings are loaded with active unarchived memories
+  using the active-chat stale guard.
 - `activeChatIdRef` guards against appending/reloading assistant messages into a
   chat that is no longer active.
 - Search result jumps are scoped by `chat_id` and `message_id`, so selecting a
@@ -761,7 +902,8 @@ arrow/enter keyboard selection, and closes on escape or backdrop click. Initial
 enabled commands call existing handlers for new chat, chat search, model manager
 open, model refresh, model selection, recommended model downloads, database
 diagnostics, Model Lab, chat summaries, and active chat deletion when valid. It
-also exposes active-chat export commands for Markdown, JSON, and plain text.
+also exposes Memory Inspector and active-chat export commands for Markdown,
+JSON, and plain text.
 Future surfaces
 such as settings and folder indexing are represented as disabled commands with
 visible reasons instead of placeholder business logic.
@@ -777,6 +919,13 @@ and command palette. It shows the current summary, source message range, model,
 version, updated time, a prompt-use toggle, manual edit/save/delete actions, and
 a job-backed generate/update action. The active chat shows an explicit summary
 context indicator when prompt use is enabled.
+
+The Memory Inspector is reachable from the command palette and active chat
+action group. It lists global and conversation memories, archived memories,
+source message links where present, pin/archive/restore/forget controls, a
+manual create/edit form, and a visible per-chat memory-use switch. Message rows
+include a user-triggered `Remember` action that creates source-linked memory
+only when the user confirms the form.
 
 The sidebar search uses `search_conversations` in the Tauri desktop app. Results
 show conversation title, result source, date, message count, and snippet parts
@@ -820,12 +969,15 @@ Current user-visible error surfaces:
   technical details where available.
 - `summaryError` for summary loading, generation, editing, prompt-use toggling,
   and deletion failures.
+- `memoryError` for memory loading, creation, editing, archive/restore, forget,
+  source jumping, and prompt-use toggling failures.
 - `chatSearchError` for search-specific failures.
 - `databaseDiagnosticsError` for database diagnostics loading failures.
 - Readiness notices for Ollama offline, no local models, selected model missing,
   and browser preview.
 - Per-message generation details for assistant messages with associated
-  `generation_run` metadata.
+  `generation_run` metadata, including memory snapshots when memories were
+  included in the prompt.
 
 Ollama connection failures are normalized to:
 
@@ -854,15 +1006,15 @@ The frontend suppresses that cancellation message in the active chat error UI.
   commands have typed wrappers.
 - The command registry is centralized in `src/App.tsx`, but it is still coupled
   to local component state and handlers until frontend feature modules exist.
-- Schema setup records current user version 3, but there is not yet an
+- Schema setup records current user version 5, but there is not yet an
   incremental migrations directory for future versions.
 - The SQLite connection is protected by one mutex, so long database work would
   block other database operations.
 - Database diagnostics are a focused modal, not the full diagnostics center
   planned for later chunks.
 - Chat generation still sends the full conversation every time. The only prompt
-  assembly behavior today is the optional user-enabled summary system context;
-  there is no broader context diagnostics surface yet.
+  assembly behavior today is optional user-enabled summary and memory system
+  context; there is no broader context diagnostics surface yet.
 - The generation task registry is in-memory and keyed only by chat ID.
 - Cancellation depends on checking a flag between blocking stream reads.
 - Failed runs with no assistant text are persisted but only surface as inline
@@ -898,6 +1050,10 @@ latency, history, and cancellation.
 Chunk 10 adds the persistent `conversation_summaries` table, manual summary
 save/edit/delete/toggle commands, a cancellable `conversation_summary` job,
 optional user-visible prompt inclusion, and a Conversation Summary panel.
+Chunk 11 adds the persistent `memories`, `memory_prompt_settings`, and
+`generation_memory_uses` tables, manual Memory Inspector CRUD, per-chat memory
+prompt toggles, explicit source-message memory creation, and memory-use
+snapshots in assistant message diagnostics.
 
 Relevant checks:
 

@@ -22,6 +22,7 @@ export type GenerationRun = {
   eval_duration_ms: number | null
   tokens_per_second: number | null
   error_message: string | null
+  memory_uses: PromptMemoryUse[]
 }
 
 export type ChatMessage = {
@@ -144,6 +145,41 @@ export type ConversationSummary = {
   updated_at: number
 }
 
+export type MemoryScopeType = 'global' | 'conversation' | 'project'
+
+export type Memory = {
+  id: string
+  scope_type: MemoryScopeType
+  scope_id: string | null
+  content: string
+  source_conversation_id: string | null
+  source_message_id: number | null
+  confidence: number | null
+  pinned: boolean
+  archived_at: number | null
+  created_at: number
+  updated_at: number
+}
+
+export type MemoryPromptSetting = {
+  conversation_id: string
+  enabled_for_prompt: boolean
+  created_at: number
+  updated_at: number
+}
+
+export type PromptMemoryUse = {
+  id: string
+  generation_run_id: string
+  memory_id: string | null
+  content: string
+  scope_type: MemoryScopeType
+  scope_id: string | null
+  source_conversation_id: string | null
+  source_message_id: number | null
+  used_at: number
+}
+
 export type ModelBenchmarkStatus =
   | 'queued'
   | 'running'
@@ -192,6 +228,14 @@ const commands = {
   setConversationSummaryEnabled: 'set_conversation_summary_enabled',
   deleteConversationSummary: 'delete_conversation_summary',
   generateConversationSummary: 'generate_conversation_summary',
+  listMemories: 'list_memories',
+  createMemory: 'create_memory',
+  updateMemory: 'update_memory',
+  archiveMemory: 'archive_memory',
+  restoreMemory: 'restore_memory',
+  deleteMemory: 'delete_memory',
+  getMemoryPromptSetting: 'get_memory_prompt_setting',
+  setMemoryPromptEnabled: 'set_memory_prompt_enabled',
   listModelBenchmarks: 'list_model_benchmarks',
   listModelUsage: 'list_model_usage',
   startModelBenchmark: 'start_model_benchmark',
@@ -270,6 +314,64 @@ export function generateConversationSummary(chatId: string, model: string) {
   return invoke<ConversationSummary>(commands.generateConversationSummary, {
     chatId,
     model,
+  })
+}
+
+export function listMemories(includeArchived = false) {
+  return invoke<Memory[]>(commands.listMemories, { includeArchived })
+}
+
+export function createMemory(
+  scopeType: MemoryScopeType,
+  scopeId: string | null,
+  content: string,
+  sourceConversationId: string | null,
+  sourceMessageId: number | null,
+  pinned: boolean,
+) {
+  return invoke<Memory>(commands.createMemory, {
+    scopeType,
+    scopeId,
+    content,
+    sourceConversationId,
+    sourceMessageId,
+    pinned,
+  })
+}
+
+export function updateMemory(memoryId: string, content: string, pinned: boolean) {
+  return invoke<Memory>(commands.updateMemory, {
+    memoryId,
+    content,
+    pinned,
+  })
+}
+
+export function archiveMemory(memoryId: string) {
+  return invoke<Memory>(commands.archiveMemory, { memoryId })
+}
+
+export function restoreMemory(memoryId: string) {
+  return invoke<Memory>(commands.restoreMemory, { memoryId })
+}
+
+export function deleteMemory(memoryId: string) {
+  return invoke<boolean>(commands.deleteMemory, { memoryId })
+}
+
+export function getMemoryPromptSetting(chatId: string) {
+  return invoke<MemoryPromptSetting>(commands.getMemoryPromptSetting, {
+    chatId,
+  })
+}
+
+export function setMemoryPromptEnabled(
+  chatId: string,
+  enabledForPrompt: boolean,
+) {
+  return invoke<MemoryPromptSetting>(commands.setMemoryPromptEnabled, {
+    chatId,
+    enabledForPrompt,
   })
 }
 

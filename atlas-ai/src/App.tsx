@@ -9,21 +9,29 @@ import {
 } from 'react'
 import {
   cancelJob,
+  archiveMemory,
+  createMemory,
   deleteOllamaModel,
   deleteConversationSummary,
+  deleteMemory,
   downloadOllamaModel,
   exportChat,
   generateConversationSummary,
   getConversationSummary,
   getDatabaseDiagnostics,
+  getMemoryPromptSetting,
   getOllamaStatus,
   listModelBenchmarks,
   listModelUsage,
   listJobs,
+  listMemories,
+  restoreMemory,
   saveConversationSummary,
   searchConversations,
   setConversationSummaryEnabled,
+  setMemoryPromptEnabled,
   startModelBenchmark,
+  updateMemory,
   type ChatExport,
   type ChatExportFormat,
   type ChatMessage,
@@ -33,6 +41,9 @@ import {
   type GenerationRun,
   type Job,
   type JobEvent,
+  type Memory,
+  type MemoryPromptSetting,
+  type MemoryScopeType,
   type ModelBenchmark,
   type ModelUsage,
   type OllamaModel,
@@ -61,6 +72,7 @@ type CommandId =
   | 'chat.search'
   | 'chat.delete_active'
   | 'chat.summary.open'
+  | 'memory.inspector.open'
   | 'model.manager.open'
   | 'model.refresh'
   | 'model.switch.open'
@@ -75,7 +87,7 @@ type CommandId =
 type AppCommand = {
   id: CommandId
   title: string
-  category: 'Chat' | 'Model' | 'App' | 'Knowledge'
+  category: 'Chat' | 'Model' | 'Memory' | 'App' | 'Knowledge'
   description?: string
   disabledReason?: string
   keywords?: string[]
@@ -102,6 +114,7 @@ type CommandRegistryContext = {
   onOpenChatSearch: () => void
   onOpenConversationSummary: () => void
   onOpenDiagnostics: () => void
+  onOpenMemoryInspector: () => void
   onOpenModelLab: () => void
   onOpenModelManager: () => void
   onRefreshModels: () => Promise<void>
@@ -300,6 +313,31 @@ function MessageDiagnostics({ run }: { run: GenerationRun | null }) {
       </dl>
       {run.error_message ? (
         <p className="mt-2 break-words text-zinc-400">{run.error_message}</p>
+      ) : null}
+      {run.memory_uses.length > 0 ? (
+        <div className="mt-3 border-t border-zinc-800/80 pt-2">
+          <p className="text-zinc-400">
+            Memory used: {run.memory_uses.length}
+          </p>
+          <div className="mt-2 grid gap-1.5">
+            {run.memory_uses.map((memoryUse) => (
+              <div
+                className="rounded-lg bg-zinc-950 px-2 py-1.5 text-zinc-400"
+                key={memoryUse.id}
+              >
+                <p className="break-words">
+                  {truncateText(memoryUse.content, 180)}
+                </p>
+                <p className="mt-1 text-[11px] text-zinc-600">
+                  {memoryUse.scope_type}
+                  {memoryUse.source_message_id !== null
+                    ? ` - source message ${memoryUse.source_message_id}`
+                    : ''}
+                </p>
+              </div>
+            ))}
+          </div>
+        </div>
       ) : null}
     </details>
   )
@@ -618,6 +656,33 @@ function formatSummaryRange(summary: ConversationSummary | null) {
   return `Messages ${summary.source_message_start_id}-${summary.source_message_end_id}`
 }
 
+function formatMemoryScope(memory: Pick<Memory, 'scope_type' | 'scope_id'>) {
+  switch (memory.scope_type) {
+    case 'global':
+      return 'Global'
+    case 'conversation':
+      return memory.scope_id ? 'Conversation' : 'Conversation'
+    case 'project':
+      return memory.scope_id ? `Project ${memory.scope_id}` : 'Project'
+  }
+}
+
+function formatMemorySource(memory: Memory) {
+  if (memory.source_message_id !== null) {
+    return `Message ${memory.source_message_id}`
+  }
+
+  if (memory.source_conversation_id !== null) {
+    return 'Conversation source'
+  }
+
+  return 'Manual'
+}
+
+function truncateText(value: string, maxLength = 120) {
+  return value.length > maxLength ? `${value.slice(0, maxLength - 3)}...` : value
+}
+
 function buildCommandRegistry(context: CommandRegistryContext): AppCommand[] {
   const commands: AppCommand[] = [
     {
@@ -728,6 +793,17 @@ function buildCommandRegistry(context: CommandRegistryContext): AppCommand[] {
   })
 
   commands.push(
+    {
+      id: 'memory.inspector.open',
+      title: 'Open Memory Inspector',
+      category: 'Memory',
+      description: 'Review stored memories.',
+      disabledReason: context.isDesktop
+        ? undefined
+        : 'Memory Inspector requires the Tauri desktop app.',
+      keywords: ['remember preferences context'],
+      run: context.onOpenMemoryInspector,
+    },
     {
       id: 'settings.open',
       title: 'Open settings',
@@ -1000,6 +1076,28 @@ function SummaryIcon({ className = 'h-5 w-5' }: IconProps) {
   )
 }
 
+function MemoryIcon({ className = 'h-5 w-5' }: IconProps) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M12 3a6 6 0 0 0-4 10.47V18h8v-4.53A6 6 0 0 0 12 3Z" />
+      <path d="M9 21h6" />
+      <path d="M10 18h4" />
+      <path d="M9.5 9.5h.01" />
+      <path d="M14.5 9.5h.01" />
+      <path d="M10 13h4" />
+    </svg>
+  )
+}
+
 function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true)
   const [chats, setChats] = useState<ChatSummary[]>([])
@@ -1015,6 +1113,22 @@ function App() {
     'generate' | 'save' | 'delete' | 'toggle' | null
   >(null)
   const [summaryError, setSummaryError] = useState<string | null>(null)
+  const [memories, setMemories] = useState<Memory[]>([])
+  const [memoryPromptSetting, setMemoryPromptSetting] =
+    useState<MemoryPromptSetting | null>(null)
+  const [isMemoryInspectorOpen, setIsMemoryInspectorOpen] = useState(false)
+  const [isMemoryLoading, setIsMemoryLoading] = useState(false)
+  const [memoryError, setMemoryError] = useState<string | null>(null)
+  const [memoryAction, setMemoryAction] = useState<string | null>(null)
+  const [memoryDraft, setMemoryDraft] = useState('')
+  const [memoryScope, setMemoryScope] = useState<MemoryScopeType>('global')
+  const [memoryPinned, setMemoryPinned] = useState(false)
+  const [editingMemoryId, setEditingMemoryId] = useState<string | null>(null)
+  const [memorySource, setMemorySource] = useState<{
+    conversationId: string
+    messageId: number
+    label: string
+  } | null>(null)
   const [draft, setDraft] = useState('')
   const [historyError, setHistoryError] = useState<string | null>(null)
   const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(() =>
@@ -1250,6 +1364,46 @@ function App() {
       .catch((error: unknown) => {
         if (!ignore && activeChatIdRef.current === chatId) {
           setSummaryError(String(error))
+        }
+      })
+
+    return () => {
+      ignore = true
+    }
+  }, [activeChatId])
+
+  useEffect(() => {
+    if (!activeChatId || !isTauriRuntime()) {
+      return
+    }
+
+    let ignore = false
+    const chatId = activeChatId
+
+    Promise.all([getMemoryPromptSetting(chatId), listMemories(false)])
+      .then(([setting, loadedMemories]) => {
+        if (!ignore && activeChatIdRef.current === chatId) {
+          setMemoryPromptSetting(setting)
+          setMemories((currentMemories) => {
+            const archivedMemories = currentMemories.filter(
+              (memory) => memory.archived_at !== null,
+            )
+            return [
+              ...loadedMemories,
+              ...archivedMemories.filter(
+                (memory) =>
+                  !loadedMemories.some(
+                    (loadedMemory) => loadedMemory.id === memory.id,
+                  ),
+              ),
+            ]
+          })
+          setMemoryError(null)
+        }
+      })
+      .catch((error: unknown) => {
+        if (!ignore && activeChatIdRef.current === chatId) {
+          setMemoryError(String(error))
         }
       })
 
@@ -1575,6 +1729,216 @@ function App() {
     }
   }
 
+  async function refreshMemoryData(showLoading = true) {
+    if (!isTauriRuntime()) {
+      setMemoryError('Memory Inspector requires the Tauri desktop app.')
+      return
+    }
+
+    try {
+      if (showLoading) {
+        setIsMemoryLoading(true)
+      }
+      const [loadedMemories, setting] = await Promise.all([
+        listMemories(true),
+        activeChatId
+          ? getMemoryPromptSetting(activeChatId)
+          : Promise.resolve(null),
+      ])
+      setMemories(loadedMemories)
+      setMemoryPromptSetting(setting)
+      setMemoryError(null)
+    } catch (error) {
+      setMemoryError(String(error))
+    } finally {
+      if (showLoading) {
+        setIsMemoryLoading(false)
+      }
+    }
+  }
+
+  function resetMemoryForm() {
+    setEditingMemoryId(null)
+    setMemoryDraft('')
+    setMemoryScope(activeChatId ? 'conversation' : 'global')
+    setMemoryPinned(false)
+    setMemorySource(null)
+  }
+
+  function openMemoryInspector() {
+    setIsMemoryInspectorOpen(true)
+    if (!memoryDraft.trim() && !editingMemoryId) {
+      setMemoryScope(activeChatId ? 'conversation' : 'global')
+    }
+    void refreshMemoryData()
+  }
+
+  async function handleSaveMemory() {
+    if (!isTauriRuntime()) {
+      setMemoryError('Memory Inspector requires the Tauri desktop app.')
+      return
+    }
+
+    const scopeId = memoryScope === 'conversation' ? activeChatId : null
+    if (memoryScope === 'conversation' && !scopeId) {
+      setMemoryError('Open a chat before creating conversation memory.')
+      return
+    }
+
+    try {
+      setMemoryAction(editingMemoryId ? `save:${editingMemoryId}` : 'create')
+      const savedMemory = editingMemoryId
+        ? await updateMemory(editingMemoryId, memoryDraft, memoryPinned)
+        : await createMemory(
+            memoryScope,
+            scopeId,
+            memoryDraft,
+            memorySource?.conversationId ?? null,
+            memorySource?.messageId ?? null,
+            memoryPinned,
+          )
+      setMemories((currentMemories) =>
+        [savedMemory, ...currentMemories.filter((memory) => memory.id !== savedMemory.id)]
+          .sort((first, second) => Number(second.pinned) - Number(first.pinned) || second.updated_at - first.updated_at),
+      )
+      resetMemoryForm()
+      setMemoryError(null)
+    } catch (error) {
+      setMemoryError(String(error))
+    } finally {
+      setMemoryAction(null)
+    }
+  }
+
+  function handleEditMemory(memory: Memory) {
+    setEditingMemoryId(memory.id)
+    setMemoryDraft(memory.content)
+    setMemoryScope(memory.scope_type)
+    setMemoryPinned(memory.pinned)
+    setMemorySource(
+      memory.source_conversation_id && memory.source_message_id
+        ? {
+            conversationId: memory.source_conversation_id,
+            messageId: memory.source_message_id,
+            label: `Message ${memory.source_message_id}`,
+          }
+        : null,
+    )
+  }
+
+  async function handleArchiveMemory(memory: Memory) {
+    if (!isTauriRuntime()) {
+      return
+    }
+
+    try {
+      setMemoryAction(`archive:${memory.id}`)
+      const updatedMemory =
+        memory.archived_at === null
+          ? await archiveMemory(memory.id)
+          : await restoreMemory(memory.id)
+      setMemories((currentMemories) =>
+        currentMemories.map((currentMemory) =>
+          currentMemory.id === updatedMemory.id ? updatedMemory : currentMemory,
+        ),
+      )
+      setMemoryError(null)
+    } catch (error) {
+      setMemoryError(String(error))
+    } finally {
+      setMemoryAction(null)
+    }
+  }
+
+  async function handleDeleteMemory(memory: Memory) {
+    if (!isTauriRuntime()) {
+      return
+    }
+
+    try {
+      setMemoryAction(`delete:${memory.id}`)
+      await deleteMemory(memory.id)
+      setMemories((currentMemories) =>
+        currentMemories.filter((currentMemory) => currentMemory.id !== memory.id),
+      )
+      if (editingMemoryId === memory.id) {
+        resetMemoryForm()
+      }
+      setMemoryError(null)
+    } catch (error) {
+      setMemoryError(String(error))
+    } finally {
+      setMemoryAction(null)
+    }
+  }
+
+  async function handleSetMemoryPromptEnabled(enabledForPrompt: boolean) {
+    if (!activeChatId || !isTauriRuntime()) {
+      setMemoryError(
+        activeChatId
+          ? 'Memory Inspector requires the Tauri desktop app.'
+          : 'Open a chat before enabling memory.',
+      )
+      return
+    }
+
+    const chatId = activeChatId
+
+    try {
+      setMemoryAction('toggle-prompt')
+      const setting = await setMemoryPromptEnabled(chatId, enabledForPrompt)
+      if (activeChatIdRef.current === chatId) {
+        setMemoryPromptSetting(setting)
+      }
+      setMemoryError(null)
+    } catch (error) {
+      setMemoryError(String(error))
+    } finally {
+      setMemoryAction(null)
+    }
+  }
+
+  function handleRememberMessage(message: ChatMessage) {
+    if (!activeChatId || !isTauriRuntime()) {
+      setHistoryError('Memory Inspector requires the Tauri desktop app.')
+      return
+    }
+
+    setIsMemoryInspectorOpen(true)
+    setEditingMemoryId(null)
+    setMemoryScope('conversation')
+    setMemoryPinned(false)
+    setMemoryDraft(message.content)
+    setMemorySource({
+      conversationId: activeChatId,
+      messageId: message.id,
+      label: `${message.role} message ${message.id}`,
+    })
+    void refreshMemoryData(false)
+  }
+
+  function handleOpenMemorySource(memory: Memory) {
+    if (!memory.source_conversation_id) {
+      return
+    }
+
+    setActiveChatId(memory.source_conversation_id)
+    setActiveSummary(null)
+    setSummaryDraft('')
+    setSummaryError(null)
+    setMemoryPromptSetting(null)
+    setIsExportMenuOpen(false)
+    setPendingSearchJump(
+      memory.source_message_id === null
+        ? null
+        : {
+            chatId: memory.source_conversation_id,
+            messageId: memory.source_message_id,
+          },
+    )
+    setIsMemoryInspectorOpen(false)
+  }
+
   async function refreshModelLabData(showLoading = true) {
     if (!isTauriRuntime()) {
       setModelLabError('Model Lab requires the Tauri desktop app.')
@@ -1767,6 +2131,7 @@ function App() {
     setActiveSummary(null)
     setSummaryDraft('')
     setSummaryError(null)
+    setMemoryPromptSetting(null)
     closeChatSearch()
   }
 
@@ -1779,6 +2144,7 @@ function App() {
     setActiveSummary(null)
     setSummaryDraft('')
     setSummaryError(null)
+    setMemoryPromptSetting(null)
     setIsExportMenuOpen(false)
     setPendingSearchJump(null)
     closeChatSearch()
@@ -1789,6 +2155,7 @@ function App() {
     setActiveSummary(null)
     setSummaryDraft('')
     setSummaryError(null)
+    setMemoryPromptSetting(null)
     setIsExportMenuOpen(false)
     setPendingSearchJump(
       result.message_id === null
@@ -1941,6 +2308,7 @@ function App() {
       setActiveSummary(null)
       setSummaryDraft('')
       setSummaryError(null)
+      setMemoryPromptSetting(null)
       setHistoryError(null)
 
       if (respondingChatId === chatId) {
@@ -2018,6 +2386,16 @@ function App() {
   const activeConversationSummaryProgress = activeConversationSummaryJob
     ? getJobProgressPercent(activeConversationSummaryJob)
     : null
+  const activePromptMemories =
+    activeChatId && memoryPromptSetting?.enabled_for_prompt
+      ? memories.filter(
+          (memory) =>
+            memory.archived_at === null &&
+            (memory.scope_type === 'global' ||
+              (memory.scope_type === 'conversation' &&
+                memory.scope_id === activeChatId)),
+        )
+      : []
   const modelUsageByName = new Map(
     modelUsage.map((usage) => [usage.model_name, usage]),
   )
@@ -2064,6 +2442,7 @@ function App() {
     onOpenChatSearch: openChatSearch,
     onOpenConversationSummary: openConversationSummary,
     onOpenDiagnostics: openDiagnostics,
+    onOpenMemoryInspector: openMemoryInspector,
     onOpenModelLab: openModelLab,
     onOpenModelManager: openModelManager,
     onRefreshModels: refreshOllamaModels,
@@ -2311,6 +2690,23 @@ function App() {
       <main className="relative min-h-svh min-w-0 flex-1 overflow-hidden" aria-label="Chat">
         {activeChatId ? (
           <div className="absolute top-4 right-4 z-10 flex items-start gap-2">
+            <button
+              className={`grid h-10 w-10 place-items-center rounded-xl border shadow-[0_12px_36px_rgba(0,0,0,0.35)] transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                memoryPromptSetting?.enabled_for_prompt
+                  ? 'border-zinc-500 bg-zinc-100 text-zinc-950 hover:bg-white'
+                  : 'border-zinc-800 bg-black/90 text-zinc-300 hover:bg-zinc-950 hover:text-zinc-100'
+              }`}
+              type="button"
+              aria-label={
+                memoryPromptSetting?.enabled_for_prompt
+                  ? 'Open Memory Inspector, memory use enabled'
+                  : 'Open Memory Inspector'
+              }
+              onClick={openMemoryInspector}
+            >
+              <MemoryIcon />
+            </button>
+
             <button
               className={`grid h-10 w-10 place-items-center rounded-xl border shadow-[0_12px_36px_rgba(0,0,0,0.35)] transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
                 activeSummary?.enabled_for_prompt
@@ -2626,6 +3022,28 @@ function App() {
               </section>
             ) : null}
 
+            {memoryPromptSetting?.enabled_for_prompt ? (
+              <section className="mr-auto flex max-w-[min(100%,34rem)] flex-wrap items-center justify-between gap-3 rounded-2xl border border-zinc-800 bg-zinc-950 px-4 py-3 text-sm text-zinc-200">
+                <div className="min-w-0">
+                  <p className="font-medium text-zinc-100">
+                    Memory context on
+                  </p>
+                  <p className="mt-1 text-xs text-zinc-500">
+                    {`${activePromptMemories.length} active ${
+                      activePromptMemories.length === 1 ? 'memory' : 'memories'
+                    }`}
+                  </p>
+                </div>
+                <button
+                  className="rounded-lg border border-zinc-700 px-2.5 py-1 text-xs font-medium text-zinc-200 transition-colors hover:bg-zinc-900"
+                  type="button"
+                  onClick={openMemoryInspector}
+                >
+                  Inspect
+                </button>
+              </section>
+            ) : null}
+
             {messages.map((message) => (
               <article
                 className={`max-w-[78%] overflow-hidden rounded-2xl px-4 py-3 text-sm leading-6 break-words transition-[box-shadow,outline-color] ${
@@ -2648,6 +3066,21 @@ function App() {
                 }}
               >
                 <div>{message.content}</div>
+                {isTauriRuntime() ? (
+                  <div className="mt-3 flex justify-end">
+                    <button
+                      className={`rounded-lg border px-2 py-1 text-xs font-medium transition-colors ${
+                        message.role === 'user'
+                          ? 'border-zinc-300 text-zinc-700 hover:bg-zinc-200'
+                          : 'border-zinc-700 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100'
+                      }`}
+                      type="button"
+                      onClick={() => handleRememberMessage(message)}
+                    >
+                      Remember
+                    </button>
+                  </div>
+                ) : null}
                 {message.role === 'assistant' ? (
                   <MessageDiagnostics run={message.generation_run} />
                 ) : null}
@@ -2970,6 +3403,244 @@ function App() {
                   </button>
                 </div>
               </div>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {isMemoryInspectorOpen ? (
+        <div
+          className="fixed inset-0 z-50 bg-black/70 px-4 py-[6vh]"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setIsMemoryInspectorOpen(false)
+            }
+          }}
+        >
+          <section
+            className="mx-auto flex max-h-[88vh] w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-950 shadow-[0_24px_80px_rgba(0,0,0,0.55)]"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Memory Inspector"
+          >
+            <header className="flex items-start justify-between gap-4 border-b border-zinc-800 px-4 py-3">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-zinc-100">
+                  Memory Inspector
+                </p>
+                <p className="mt-0.5 text-xs text-zinc-500">
+                  {`${memories.length} stored ${
+                    memories.length === 1 ? 'memory' : 'memories'
+                  }`}
+                </p>
+              </div>
+              <div className="flex flex-none items-center gap-2">
+                <button
+                  className="h-8 rounded-lg border border-zinc-800 px-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+                  type="button"
+                  disabled={isMemoryLoading}
+                  onClick={() => void refreshMemoryData()}
+                >
+                  {isMemoryLoading ? 'Loading' : 'Refresh'}
+                </button>
+                <button
+                  className="grid h-8 w-8 place-items-center rounded-lg border-0 bg-transparent text-zinc-500 transition-colors hover:bg-zinc-900 hover:text-zinc-100"
+                  type="button"
+                  aria-label="Close Memory Inspector"
+                  onClick={() => setIsMemoryInspectorOpen(false)}
+                >
+                  <XIcon />
+                </button>
+              </div>
+            </header>
+
+            <div className="grid gap-4 overflow-y-auto p-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.25fr)]">
+              <section className="min-w-0">
+                {memoryError ? (
+                  <p className="mb-3 rounded-xl border border-red-900/60 bg-red-950/30 px-3 py-2 text-sm text-red-200">
+                    {memoryError}
+                  </p>
+                ) : null}
+
+                <label className="flex items-center justify-between gap-3 rounded-xl border border-zinc-800 bg-zinc-900/50 px-3 py-2 text-sm text-zinc-200">
+                  <span className="min-w-0">
+                    <span className="block font-medium text-zinc-100">
+                      Use memories in this chat
+                    </span>
+                    <span className="mt-0.5 block text-xs text-zinc-500">
+                      {activeChatId
+                        ? memoryPromptSetting?.enabled_for_prompt
+                          ? 'Enabled'
+                          : 'Disabled'
+                        : 'No active chat'}
+                    </span>
+                  </span>
+                  <input
+                    className="h-5 w-5 flex-none accent-zinc-100"
+                    type="checkbox"
+                    checked={memoryPromptSetting?.enabled_for_prompt ?? false}
+                    disabled={!activeChatId || memoryAction === 'toggle-prompt'}
+                    onChange={(event) =>
+                      void handleSetMemoryPromptEnabled(event.target.checked)
+                    }
+                  />
+                </label>
+
+                <div className="mt-4 rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-xs font-semibold tracking-[0.08em] text-zinc-500 uppercase">
+                      {editingMemoryId ? 'Edit Memory' : 'New Memory'}
+                    </p>
+                    {editingMemoryId || memorySource ? (
+                      <button
+                        className="rounded-lg border border-zinc-800 px-2 py-1 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900"
+                        type="button"
+                        onClick={resetMemoryForm}
+                      >
+                        Clear
+                      </button>
+                    ) : null}
+                  </div>
+
+                  <label className="mt-3 block text-xs text-zinc-500" htmlFor="memory-scope">
+                    Scope
+                  </label>
+                  <select
+                    className="mt-1 h-10 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-600 disabled:opacity-50"
+                    id="memory-scope"
+                    value={memoryScope}
+                    disabled={editingMemoryId !== null}
+                    onChange={(event) =>
+                      setMemoryScope(event.target.value as MemoryScopeType)
+                    }
+                  >
+                    <option value="global">Global</option>
+                    <option value="conversation" disabled={!activeChatId}>
+                      Conversation
+                    </option>
+                  </select>
+
+                  <label className="mt-3 block text-xs text-zinc-500" htmlFor="memory-content">
+                    Content
+                  </label>
+                  <textarea
+                    className="mt-1 min-h-36 w-full resize-y rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm leading-6 text-zinc-100 outline-none transition-colors placeholder:text-zinc-600 focus:border-zinc-600"
+                    id="memory-content"
+                    placeholder="Write a memory."
+                    value={memoryDraft}
+                    onChange={(event) => setMemoryDraft(event.target.value)}
+                  />
+
+                  {memorySource ? (
+                    <p className="mt-2 rounded-lg bg-zinc-950 px-2 py-1.5 text-xs text-zinc-500">
+                      Source: {memorySource.label}
+                    </p>
+                  ) : null}
+
+                  <label className="mt-3 flex items-center gap-2 text-sm text-zinc-300">
+                    <input
+                      className="h-4 w-4 accent-zinc-100"
+                      type="checkbox"
+                      checked={memoryPinned}
+                      onChange={(event) => setMemoryPinned(event.target.checked)}
+                    />
+                    <span>Pin</span>
+                  </label>
+
+                  <button
+                    className="mt-3 h-9 w-full rounded-lg bg-zinc-100 px-3 text-sm font-semibold text-zinc-950 transition-colors hover:bg-white disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500"
+                    type="button"
+                    disabled={!memoryDraft.trim() || memoryAction !== null}
+                    onClick={handleSaveMemory}
+                  >
+                    {memoryAction === 'create' ||
+                    (editingMemoryId && memoryAction === `save:${editingMemoryId}`)
+                      ? 'Saving'
+                      : editingMemoryId
+                        ? 'Save memory'
+                        : 'Add memory'}
+                  </button>
+                </div>
+              </section>
+
+              <section className="min-w-0">
+                <p className="mb-2 text-xs font-semibold tracking-[0.08em] text-zinc-500 uppercase">
+                  Stored Memories
+                </p>
+                <div className="grid gap-2">
+                  {memories.length > 0 ? (
+                    memories.map((memory) => (
+                      <div
+                        className={`rounded-xl border px-3 py-2 ${
+                          memory.archived_at
+                            ? 'border-zinc-900 bg-zinc-950/60 opacity-70'
+                            : 'border-zinc-800 bg-zinc-900/70'
+                        }`}
+                        key={memory.id}
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <p className="break-words text-sm leading-6 text-zinc-100">
+                              {memory.content}
+                            </p>
+                            <p className="mt-1 text-xs text-zinc-500">
+                              {formatMemoryScope(memory)} - {formatMemorySource(memory)}
+                              {memory.pinned ? ' - pinned' : ''}
+                              {memory.archived_at ? ' - archived' : ''}
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="mt-3 flex flex-wrap items-center gap-2">
+                          <button
+                            className="rounded-lg border border-zinc-800 px-2 py-1 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+                            type="button"
+                            disabled={memoryAction !== null}
+                            onClick={() => handleEditMemory(memory)}
+                          >
+                            Edit
+                          </button>
+                          {memory.source_conversation_id ? (
+                            <button
+                              className="rounded-lg border border-zinc-800 px-2 py-1 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900"
+                              type="button"
+                              onClick={() => handleOpenMemorySource(memory)}
+                            >
+                              Source
+                            </button>
+                          ) : null}
+                          <button
+                            className="rounded-lg border border-zinc-800 px-2 py-1 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+                            type="button"
+                            disabled={memoryAction !== null}
+                            onClick={() => handleArchiveMemory(memory)}
+                          >
+                            {memoryAction === `archive:${memory.id}`
+                              ? 'Working'
+                              : memory.archived_at
+                                ? 'Restore'
+                                : 'Archive'}
+                          </button>
+                          <button
+                            className="rounded-lg border border-red-950/80 px-2 py-1 text-xs font-medium text-red-300 transition-colors hover:bg-red-950/30 disabled:cursor-not-allowed disabled:opacity-50"
+                            type="button"
+                            disabled={memoryAction !== null}
+                            onClick={() => handleDeleteMemory(memory)}
+                          >
+                            {memoryAction === `delete:${memory.id}`
+                              ? 'Forgetting'
+                              : 'Forget'}
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="rounded-xl bg-zinc-900/70 px-3 py-2 text-sm text-zinc-500">
+                      No memories stored.
+                    </p>
+                  )}
+                </div>
+              </section>
             </div>
           </section>
         </div>
