@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import {
   type FormEvent,
   type KeyboardEvent,
@@ -7,14 +8,18 @@ import {
   useState,
 } from 'react'
 import {
+  cancelJob,
   deleteOllamaModel,
   downloadOllamaModel,
   exportChat,
   getOllamaStatus,
+  listJobs,
   type ChatExport,
   type ChatExportFormat,
   type ChatMessage,
   type GenerationRun,
+  type Job,
+  type JobEvent,
   type OllamaModel,
   type OllamaStatus,
 } from './shared/api/tauri'
@@ -65,6 +70,7 @@ type CommandRegistryContext = {
   activeChatId: string | null
   deletingChatId: string | null
   exportAction: ChatExportFormat | null
+  hasActiveModelPullJob: boolean
   isDesktop: boolean
   isOllamaStatusLoading: boolean
   modelAction: string | null
@@ -361,6 +367,10 @@ function getDownloadModelDisabledReason(
     return 'Finish the current model action first.'
   }
 
+  if (context.hasActiveModelPullJob) {
+    return 'Wait for the current model download to finish.'
+  }
+
   if (context.isOllamaStatusLoading) {
     return 'Wait for model status to finish refreshing.'
   }
@@ -401,6 +411,59 @@ function saveChatExport(exportedChat: ChatExport) {
   link.click()
   link.remove()
   window.setTimeout(() => URL.revokeObjectURL(url), 0)
+}
+
+function upsertJob(jobs: Job[], job: Job) {
+  return [job, ...jobs.filter((currentJob) => currentJob.id !== job.id)]
+    .sort((first, second) => second.created_at - first.created_at)
+    .slice(0, 10)
+}
+
+function isActiveJob(job: Job) {
+  return (
+    job.status === 'queued' ||
+    job.status === 'running' ||
+    job.status === 'cancelling'
+  )
+}
+
+function jobStatusLabel(status: Job['status']) {
+  switch (status) {
+    case 'queued':
+      return 'Queued'
+    case 'running':
+      return 'Running'
+    case 'cancelling':
+      return 'Cancelling'
+    case 'cancelled':
+      return 'Cancelled'
+    case 'succeeded':
+      return 'Succeeded'
+    case 'failed':
+      return 'Failed'
+  }
+}
+
+function getJobProgressPercent(job: Job) {
+  if (
+    job.progress_current === null ||
+    job.progress_total === null ||
+    job.progress_total <= 0
+  ) {
+    return null
+  }
+
+  return Math.min(100, Math.max(0, (job.progress_current / job.progress_total) * 100))
+}
+
+function formatJobProgress(job: Job) {
+  if (job.progress_current === null || job.progress_total === null) {
+    return jobStatusLabel(job.status)
+  }
+
+  const currentMb = job.progress_current / 1024 / 1024
+  const totalMb = job.progress_total / 1024 / 1024
+  return `${currentMb.toFixed(1)} / ${totalMb.toFixed(1)} MB`
 }
 
 function buildCommandRegistry(context: CommandRegistryContext): AppCommand[] {
@@ -767,6 +830,7 @@ function App() {
   const [selectedModel, setSelectedModel] = useState('')
   const [modelError, setModelError] = useState<UiError | null>(null)
   const [modelAction, setModelAction] = useState<string | null>(null)
+  const [jobs, setJobs] = useState<Job[]>([])
   const [isModelPanelOpen, setIsModelPanelOpen] = useState(false)
   const [isResponding, setIsResponding] = useState(false)
   const [respondingChatId, setRespondingChatId] = useState<string | null>(null)
@@ -852,6 +916,51 @@ function App() {
 
     return () => {
       ignore = true
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!isTauriRuntime()) {
+      return
+    }
+
+    let ignore = false
+    let unlisten: (() => void) | undefined
+
+    listJobs(10)
+      .then((loadedJobs) => {
+        if (!ignore) {
+          setJobs(loadedJobs)
+        }
+      })
+      .catch((error: unknown) => {
+        if (!ignore) {
+          setHistoryError(String(error))
+        }
+      })
+
+    listen<JobEvent>('job_updated', (event) => {
+      if (!ignore) {
+        setJobs((currentJobs) => upsertJob(currentJobs, event.payload.job))
+      }
+    })
+      .then((listener) => {
+        if (ignore) {
+          listener()
+          return
+        }
+
+        unlisten = listener
+      })
+      .catch((error: unknown) => {
+        if (!ignore) {
+          setHistoryError(String(error))
+        }
+      })
+
+    return () => {
+      ignore = true
+      unlisten?.()
     }
   }, [])
 
@@ -1021,16 +1130,36 @@ function App() {
 
     try {
       setModelAction(`download:${model}`)
-      const models = await downloadOllamaModel(model)
-      applyOllamaStatus(buildOllamaStatusFromModels(models, model), model)
+      const job = await downloadOllamaModel(model)
+      setJobs((currentJobs) => upsertJob(currentJobs, job))
+      applyOllamaStatus(await getOllamaStatus(model), model)
       setModelError(null)
     } catch (error) {
-      setModelError({
-        message: 'Could not download model.',
-        details: String(error),
-      })
+      const details = String(error)
+      if (details === 'Job cancelled') {
+        setModelError(null)
+      } else {
+        setModelError({
+          message: 'Could not download model.',
+          details,
+        })
+      }
     } finally {
       setModelAction(null)
+    }
+  }
+
+  async function handleCancelJob(jobId: string) {
+    if (!isTauriRuntime()) {
+      return
+    }
+
+    try {
+      const job = await cancelJob(jobId)
+      setJobs((currentJobs) => upsertJob(currentJobs, job))
+      setHistoryError(null)
+    } catch (error) {
+      setHistoryError(String(error))
     }
   }
 
@@ -1306,8 +1435,15 @@ function App() {
     isTauriRuntime(),
   )
   const modelPanelEmptyText = getModelPanelEmptyText(ollamaStatus)
+  const visibleJobs = jobs.filter(
+    (job) => isActiveJob(job) || job.status === 'failed',
+  )
+  const activeModelPullJob = jobs.find(
+    (job) => job.job_type === 'model_pull' && isActiveJob(job),
+  )
   const modelDownloadsDisabled =
     modelAction !== null ||
+    activeModelPullJob !== undefined ||
     isOllamaStatusLoading ||
     !isTauriRuntime() ||
     ollamaStatus?.status === 'unavailable'
@@ -1315,6 +1451,7 @@ function App() {
     activeChatId,
     deletingChatId,
     exportAction,
+    hasActiveModelPullJob: activeModelPullJob !== undefined,
     isDesktop: isTauriRuntime(),
     isOllamaStatusLoading,
     modelAction,
@@ -1869,6 +2006,75 @@ function App() {
         </form>
       </main>
       </div>
+
+      {visibleJobs.length > 0 ? (
+        <section
+          className="fixed right-4 bottom-24 z-30 grid w-[min(24rem,calc(100%-2rem))] gap-2"
+          aria-label="Jobs"
+        >
+          {visibleJobs.slice(0, 3).map((job) => {
+            const progressPercent = getJobProgressPercent(job)
+
+            return (
+              <div
+                className={`rounded-xl border bg-zinc-950/95 px-3 py-2 shadow-[0_14px_44px_rgba(0,0,0,0.45)] ${
+                  job.status === 'failed'
+                    ? 'border-red-900/70'
+                    : 'border-zinc-800'
+                }`}
+                key={job.id}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium text-zinc-100">
+                      {job.label}
+                    </p>
+                    <p className="mt-0.5 text-xs text-zinc-500">
+                      {formatJobProgress(job)}
+                    </p>
+                  </div>
+                  <div className="flex flex-none items-center gap-2">
+                    <span
+                      className={`rounded-lg px-2 py-1 text-[11px] font-medium ${
+                        job.status === 'failed'
+                          ? 'bg-red-950/50 text-red-200'
+                          : 'bg-zinc-900 text-zinc-400'
+                      }`}
+                    >
+                      {jobStatusLabel(job.status)}
+                    </span>
+                    {isActiveJob(job) ? (
+                      <button
+                        className="rounded-lg border border-zinc-800 px-2 py-1 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+                        type="button"
+                        disabled={job.status === 'cancelling'}
+                        onClick={() => handleCancelJob(job.id)}
+                      >
+                        Cancel
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+
+                {progressPercent !== null ? (
+                  <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-zinc-900">
+                    <div
+                      className="h-full rounded-full bg-zinc-100 transition-[width]"
+                      style={{ width: `${progressPercent}%` }}
+                    />
+                  </div>
+                ) : null}
+
+                {job.status === 'failed' && job.error_message ? (
+                  <p className="mt-2 break-words text-xs text-red-200/90">
+                    {job.error_message}
+                  </p>
+                ) : null}
+              </div>
+            )
+          })}
+        </section>
+      ) : null}
 
       {isCommandPaletteOpen ? (
         <div

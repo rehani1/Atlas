@@ -54,11 +54,53 @@ export type ChatExport = {
   content: string
 }
 
+export type JobType =
+  | 'chat_generation'
+  | 'model_pull'
+  | 'model_delete'
+  | 'export_conversation'
+  | 'document_import'
+  | 'embedding_index'
+  | 'model_benchmark'
+  | 'conversation_summary'
+
+export type JobStatus =
+  | 'queued'
+  | 'running'
+  | 'cancelling'
+  | 'cancelled'
+  | 'succeeded'
+  | 'failed'
+
+export type Job = {
+  id: string
+  job_type: JobType
+  status: JobStatus
+  progress_current: number | null
+  progress_total: number | null
+  label: string
+  payload_json: string | null
+  result_json: string | null
+  error_message: string | null
+  created_at: number
+  started_at: number | null
+  completed_at: number | null
+  cancelled_at: number | null
+}
+
+export type JobEvent = {
+  job_id: string
+  job_type: JobType
+  job: Job
+}
+
 const commands = {
   getOllamaStatus: 'get_ollama_status',
   downloadOllamaModel: 'download_ollama_model',
   deleteOllamaModel: 'delete_ollama_model',
   exportChat: 'export_chat',
+  listJobs: 'list_jobs',
+  cancelJob: 'cancel_job',
 } as const
 
 export function getOllamaStatus(selectedModel?: string) {
@@ -68,7 +110,7 @@ export function getOllamaStatus(selectedModel?: string) {
 }
 
 export function downloadOllamaModel(model: string) {
-  return invoke<OllamaModel[]>(commands.downloadOllamaModel, { model })
+  return invoke<Job>(commands.downloadOllamaModel, { model })
 }
 
 export function deleteOllamaModel(model: string) {
@@ -77,4 +119,12 @@ export function deleteOllamaModel(model: string) {
 
 export function exportChat(chatId: string, format: ChatExportFormat) {
   return invoke<ChatExport>(commands.exportChat, { chatId, format })
+}
+
+export function listJobs(limit = 10) {
+  return invoke<Job[]>(commands.listJobs, { limit })
+}
+
+export function cancelJob(jobId: string) {
+  return invoke<Job>(commands.cancelJob, { jobId })
 }

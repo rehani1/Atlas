@@ -2,9 +2,10 @@ mod app;
 mod domain;
 mod infra;
 
-use app::models as model_service;
+use app::{jobs as job_service, models as model_service};
+use domain::job::{Job, JobEvent, JobStatus, JobType};
 use domain::model::{validate_ollama_model_name, OllamaModel, OllamaStatus};
-use infra::ollama;
+use infra::{jobs as job_repository, ollama};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,14 +18,20 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tauri::{Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
+#[derive(Clone)]
 struct ChatStore {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 #[derive(Default)]
 struct GenerationTasks {
+    tasks: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+#[derive(Default)]
+struct JobTasks {
     tasks: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
@@ -208,8 +215,15 @@ impl ChatStore {
       ",
         )?;
 
+        job_repository::create_schema(&conn)?;
+        let recovered_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or_default();
+        job_repository::mark_interrupted(&conn, recovered_at)?;
+
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         })
     }
 }
@@ -220,6 +234,112 @@ fn now_millis() -> Result<i64, String> {
         .map_err(|error| error.to_string())?;
 
     Ok(duration.as_millis() as i64)
+}
+
+fn emit_job_event(app: &AppHandle, job: &Job) -> Result<(), String> {
+    app.emit(
+        "job_updated",
+        JobEvent {
+            job_id: job.id.clone(),
+            job_type: job.job_type,
+            job: job.clone(),
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn model_pull_label(model: &str, status: &str) -> String {
+    if status == "success" {
+        return format!("Downloaded {model}");
+    }
+
+    format!("Downloading {model}: {status}")
+}
+
+fn update_model_pull_progress(
+    store: &ChatStore,
+    app: &AppHandle,
+    job_id: &str,
+    model: &str,
+    progress: ollama::PullProgress,
+) -> Result<(), String> {
+    let label = model_pull_label(model, &progress.status);
+    let job = {
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        job_service::update_progress(
+            &conn,
+            job_id,
+            progress.completed,
+            progress.total,
+            Some(&label),
+        )?
+    };
+
+    emit_job_event(app, &job)
+}
+
+fn run_model_pull_job(
+    store: ChatStore,
+    app: AppHandle,
+    job_id: String,
+    model: String,
+    cancellation: Arc<AtomicBool>,
+) -> Result<Job, String> {
+    let running_job = {
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        job_service::start(&conn, &job_id, now_millis()?)?
+    };
+    emit_job_event(&app, &running_job)?;
+
+    let pull_result = ollama::pull_model_stream(model.clone(), cancellation.clone(), |progress| {
+        update_model_pull_progress(&store, &app, &job_id, &model, progress)
+    });
+    let completed_at = now_millis()?;
+    let final_job = match pull_result {
+        Ok(()) if cancellation.load(Ordering::SeqCst) => {
+            let conn = store
+                .conn
+                .lock()
+                .map_err(|_| "Database lock was poisoned".to_string())?;
+            job_service::finish_cancelled(&conn, &job_id, completed_at)?
+        }
+        Ok(()) => {
+            let models = model_service::list_models()?;
+            let result_json = serde_json::json!({
+              "model": model,
+              "models": models
+            })
+            .to_string();
+            let conn = store
+                .conn
+                .lock()
+                .map_err(|_| "Database lock was poisoned".to_string())?;
+            job_service::finish_succeeded(&conn, &job_id, Some(&result_json), completed_at)?
+        }
+        Err(error) if cancellation.load(Ordering::SeqCst) || error == "Job cancelled" => {
+            let conn = store
+                .conn
+                .lock()
+                .map_err(|_| "Database lock was poisoned".to_string())?;
+            job_service::finish_cancelled(&conn, &job_id, completed_at)?
+        }
+        Err(error) => {
+            let conn = store
+                .conn
+                .lock()
+                .map_err(|_| "Database lock was poisoned".to_string())?;
+            job_service::finish_failed(&conn, &job_id, &error, completed_at)?
+        }
+    };
+
+    emit_job_event(&app, &final_job)?;
+    Ok(final_job)
 }
 
 fn nanos_to_millis(nanos: Option<i64>) -> Option<i64> {
@@ -1201,24 +1321,124 @@ async fn list_ollama_models() -> Result<Vec<OllamaModel>, String> {
 }
 
 #[tauri::command]
-async fn download_ollama_model(model: String) -> Result<Vec<OllamaModel>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let model = validate_ollama_model_name(&model)?;
-        let body = serde_json::json!({
-          "name": model,
-          "stream": false
-        })
-        .to_string();
-        let response = ollama::request("POST", "/api/pull", Some(body))?;
+fn list_jobs(store: State<'_, ChatStore>, limit: Option<i64>) -> Result<Vec<Job>, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    job_service::list_recent(&conn, limit.unwrap_or(10))
+}
 
-        if !(200..300).contains(&response.status_code) {
-            return Err(ollama::error(&response));
+#[tauri::command]
+fn cancel_job(
+    app: AppHandle,
+    store: State<'_, ChatStore>,
+    tasks: State<'_, JobTasks>,
+    job_id: String,
+) -> Result<Job, String> {
+    let job = {
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        let existing_job =
+            job_service::get(&conn, &job_id)?.ok_or_else(|| "Job was not found".to_string())?;
+
+        if job_service::is_terminal(existing_job.status) {
+            existing_job
+        } else {
+            job_service::request_cancel(&conn, &job_id, now_millis()?)?
         }
+    };
 
-        model_service::list_models()
+    if !job_service::is_terminal(job.status) {
+        let cancellation = tasks
+            .tasks
+            .lock()
+            .map_err(|_| "Job task lock was poisoned".to_string())?
+            .remove(&job_id);
+
+        if let Some(cancellation) = cancellation {
+            cancellation.store(true, Ordering::SeqCst);
+        }
+    }
+
+    emit_job_event(&app, &job)?;
+    Ok(job)
+}
+
+#[tauri::command]
+async fn download_ollama_model(
+    app: AppHandle,
+    store: State<'_, ChatStore>,
+    tasks: State<'_, JobTasks>,
+    model: String,
+) -> Result<Job, String> {
+    let model = validate_ollama_model_name(&model)?;
+    let payload_json = serde_json::json!({ "model": &model }).to_string();
+    let job = {
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        job_service::create(
+            &conn,
+            JobType::ModelPull,
+            &format!("Queued download for {model}"),
+            Some(&payload_json),
+            now_millis()?,
+        )?
+    };
+    let cancellation = Arc::new(AtomicBool::new(false));
+    {
+        tasks
+            .tasks
+            .lock()
+            .map_err(|_| "Job task lock was poisoned".to_string())?
+            .insert(job.id.clone(), cancellation.clone());
+    }
+    emit_job_event(&app, &job)?;
+
+    let store_for_job = store.inner().clone();
+    let app_for_job = app.clone();
+    let job_id = job.id.clone();
+    let job_id_for_cleanup = job.id.clone();
+    let cancellation_for_job = cancellation.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        run_model_pull_job(
+            store_for_job,
+            app_for_job,
+            job_id,
+            model,
+            cancellation_for_job,
+        )
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())?;
+
+    {
+        let mut tasks = tasks
+            .tasks
+            .lock()
+            .map_err(|_| "Job task lock was poisoned".to_string())?;
+        if tasks
+            .get(&job_id_for_cleanup)
+            .is_some_and(|current_task| Arc::ptr_eq(current_task, &cancellation))
+        {
+            tasks.remove(&job_id_for_cleanup);
+        }
+    }
+
+    let final_job = result?;
+    match final_job.status {
+        JobStatus::Succeeded => Ok(final_job),
+        JobStatus::Cancelled => Err("Job cancelled".to_string()),
+        JobStatus::Failed => Err(final_job
+            .error_message
+            .clone()
+            .unwrap_or_else(|| "Job failed".to_string())),
+        _ => Ok(final_job),
+    }
 }
 
 #[tauri::command]
@@ -1428,6 +1648,7 @@ pub fn run() {
             std::fs::create_dir_all(&app_data_dir)?;
             app.manage(ChatStore::new(app_data_dir.join("atlas.sqlite3"))?);
             app.manage(GenerationTasks::default());
+            app.manage(JobTasks::default());
 
             Ok(())
         })
@@ -1441,6 +1662,8 @@ pub fn run() {
             export_chat,
             get_ollama_status,
             list_ollama_models,
+            list_jobs,
+            cancel_job,
             download_ollama_model,
             delete_ollama_model,
             generate_assistant_response,
@@ -1452,9 +1675,14 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use rusqlite::Connection;
+
+    use super::app::jobs as job_service;
+    use super::domain::job::{JobStatus, JobType};
     use super::domain::model::{
         build_ollama_status, validate_ollama_model_name, OllamaModel, OllamaStatusKind,
     };
+    use super::infra::jobs as job_repository;
     use super::{
         calculate_tokens_per_second, escape_like_pattern, format_timestamp_ms, nanos_to_millis,
         normalize_title, render_chat_export, sanitize_file_name, ChatExportFormat, ChatMessage,
@@ -1616,6 +1844,60 @@ mod tests {
         let text =
             render_chat_export(&chat, &messages, ChatExportFormat::PlainText, 2_000).unwrap();
         assert!(text.contains("Generation: model: llama3.2:3b; status: failed"));
+    }
+
+    #[test]
+    fn job_service_persists_progress_and_cancellation() {
+        let conn = Connection::open_in_memory().unwrap();
+        job_repository::create_schema(&conn).unwrap();
+
+        let job = job_service::create(
+            &conn,
+            JobType::ModelPull,
+            "Queued download",
+            Some(r#"{"model":"llama3.2:3b"}"#),
+            100,
+        )
+        .unwrap();
+        assert_eq!(job.job_type, JobType::ModelPull);
+        assert_eq!(job.status, JobStatus::Queued);
+
+        let running = job_service::start(&conn, &job.id, 125).unwrap();
+        assert_eq!(running.status, JobStatus::Running);
+        assert_eq!(running.started_at, Some(125));
+
+        let progress =
+            job_service::update_progress(&conn, &job.id, Some(50), Some(100), Some("Halfway"))
+                .unwrap();
+        assert_eq!(progress.progress_current, Some(50));
+        assert_eq!(progress.progress_total, Some(100));
+        assert_eq!(progress.label, "Halfway");
+
+        let cancelling = job_service::request_cancel(&conn, &job.id, 150).unwrap();
+        assert_eq!(cancelling.status, JobStatus::Cancelling);
+        assert_eq!(cancelling.cancelled_at, Some(150));
+
+        let cancelled = job_service::finish_cancelled(&conn, &job.id, 175).unwrap();
+        assert_eq!(cancelled.status, JobStatus::Cancelled);
+        assert_eq!(cancelled.completed_at, Some(175));
+
+        let recent_jobs = job_service::list_recent(&conn, 10).unwrap();
+        assert_eq!(recent_jobs.len(), 1);
+        assert_eq!(recent_jobs[0].id, job.id);
+
+        let interrupted =
+            job_service::create(&conn, JobType::ModelPull, "Interrupted download", None, 200)
+                .unwrap();
+        job_service::start(&conn, &interrupted.id, 225).unwrap();
+        let recovered_count = job_repository::mark_interrupted(&conn, 250).unwrap();
+        assert_eq!(recovered_count, 1);
+
+        let recovered = job_service::get(&conn, &interrupted.id).unwrap().unwrap();
+        assert_eq!(recovered.status, JobStatus::Failed);
+        assert_eq!(
+            recovered.error_message.as_deref(),
+            Some("Job interrupted because Atlas was closed.")
+        );
     }
 
     #[test]

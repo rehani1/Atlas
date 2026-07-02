@@ -14,8 +14,10 @@ Tailwind CSS, SQLite, and Ollama. The current codebase is intentionally compact:
 - Frontend UI and state live in `src/App.tsx`.
 - Most backend state, SQLite access, command handlers, streaming, and
   cancellation still live in `src-tauri/src/lib.rs`.
-- The first backend service slice is split across `src-tauri/src/domain/model.rs`,
-  `src-tauri/src/app/models.rs`, and `src-tauri/src/infra/ollama.rs`.
+- Backend service slices now include model management and jobs:
+  `src-tauri/src/domain/model.rs`, `src-tauri/src/app/models.rs`,
+  `src-tauri/src/domain/job.rs`, `src-tauri/src/app/jobs.rs`,
+  `src-tauri/src/infra/jobs.rs`, and `src-tauri/src/infra/ollama.rs`.
 - `src-tauri/src/main.rs` only starts `atlas_lib::run()`.
 - Public release docs are `README.md` and `CHANGELOG.md`.
 
@@ -92,8 +94,10 @@ delete_chat(chat_id: String) -> bool
 export_chat(chat_id: String, format: ChatExportFormat) -> ChatExport
 get_ollama_status(selected_model: Option<String>) -> OllamaStatus
 list_ollama_models() -> Vec<OllamaModel>
-download_ollama_model(model: String) -> Vec<OllamaModel>
+download_ollama_model(model: String) -> Job
 delete_ollama_model(model: String) -> Vec<OllamaModel>
+list_jobs(limit: Option<i64>) -> Vec<Job>
+cancel_job(job_id: String) -> Job
 generate_assistant_response(chat_id: String, model: String) -> ChatMessage
 cancel_ollama_generation(chat_id: String) -> bool
 ```
@@ -154,9 +158,31 @@ OllamaStatus
 - models: OllamaModel[]
 - selected_model: string | null
 - error: string | null
+
+Job
+- id: string
+- job_type: "chat_generation" | "model_pull" | "model_delete" | "export_conversation" | "document_import" | "embedding_index" | "model_benchmark" | "conversation_summary"
+- status: "queued" | "running" | "cancelling" | "cancelled" | "succeeded" | "failed"
+- progress_current: number | null
+- progress_total: number | null
+- label: string
+- payload_json: string | null
+- result_json: string | null
+- error_message: string | null
+- created_at: number
+- started_at: number | null
+- completed_at: number | null
+- cancelled_at: number | null
+
+JobEvent
+- job_id: string
+- job_type: Job.job_type
+- job: Job
 ```
 
-There are no backend-to-frontend token events or job progress events yet.
+The backend emits `job_updated` events for job creation, start, progress,
+cancel, success, and failure. Events include both `job_id` and `job_type` so the
+frontend can ignore stale updates by job identity.
 
 ## SQLite Persistence
 
@@ -212,6 +238,38 @@ CREATE TABLE IF NOT EXISTS generation_runs (
   tokens_per_second REAL,
   error_message TEXT
 );
+
+CREATE TABLE IF NOT EXISTS jobs (
+  id TEXT PRIMARY KEY,
+  job_type TEXT NOT NULL CHECK(job_type IN (
+    'chat_generation',
+    'model_pull',
+    'model_delete',
+    'export_conversation',
+    'document_import',
+    'embedding_index',
+    'model_benchmark',
+    'conversation_summary'
+  )),
+  status TEXT NOT NULL CHECK(status IN (
+    'queued',
+    'running',
+    'cancelling',
+    'cancelled',
+    'succeeded',
+    'failed'
+  )),
+  progress_current INTEGER,
+  progress_total INTEGER,
+  label TEXT NOT NULL,
+  payload_json TEXT,
+  result_json TEXT,
+  error_message TEXT,
+  created_at INTEGER NOT NULL,
+  started_at INTEGER,
+  completed_at INTEGER,
+  cancelled_at INTEGER
+);
 ```
 
 Current indexes and trigger:
@@ -229,6 +287,12 @@ CREATE INDEX IF NOT EXISTS idx_generation_runs_conversation_started
 CREATE UNIQUE INDEX IF NOT EXISTS idx_generation_runs_message_id
   ON generation_runs(message_id)
   WHERE message_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_jobs_created_at
+  ON jobs(created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_status_created_at
+  ON jobs(status, created_at DESC);
 
 CREATE TRIGGER IF NOT EXISTS messages_after_insert_update_chat
 AFTER INSERT ON messages
@@ -252,6 +316,12 @@ Persistence behavior:
 - `generation_runs` rows are created before generation starts and are finalized
   with completed, cancelled, or failed status.
 - Assistant messages expose at most one associated generation run.
+- `jobs` rows persist long-running work. Chunk 6 uses them for model pulls with
+  status, progress bytes when Ollama provides totals, payload/result JSON, and
+  readable failure messages.
+- During startup, queued/running/cancelling jobs from a previous process are
+  marked `failed` with an interruption message so stale jobs do not remain
+  cancellable forever.
 - `export_chat` reads the chat, messages, and joined generation metadata,
   renders Markdown, JSON, or plain text in Rust, returns content with a
   sanitized filename and MIME type, and does not mutate SQLite.
@@ -339,10 +409,14 @@ Current model operations:
   wrappers over `app::models`.
 - `list_ollama_models()` calls `GET /api/tags` through `infra::ollama`.
 - `download_ollama_model(model)` validates the model name, calls
-  `POST /api/pull` with `{ "name": model, "stream": false }`, then refreshes
-  the model list.
+  `POST /api/pull` with `{ "name": model, "stream": true }`, creates a
+  persistent `model_pull` job, updates progress from Ollama JSON-line pull
+  events, and emits `job_updated`.
 - `delete_ollama_model(model)` validates the model name, calls
   `DELETE /api/delete`, then refreshes the model list.
+- `cancel_job(job_id)` marks non-terminal jobs `cancelling` and flips the
+  matching in-memory cancellation token when the job is active in this process.
+- `list_jobs(limit)` returns recent jobs for the frontend status surface.
 
 Model names reject empty strings, whitespace, double quotes, and backslashes.
 An empty Ollama model list is represented as `running_without_models`, not a
@@ -350,12 +424,14 @@ backend exception.
 
 Current limitations:
 
-- Model pull is blocking from the user's perspective.
-- Model pull uses `stream: false`, so there is no progress reporting.
-- Model pull/delete still have command-level orchestration in `lib.rs`; they
-  share extracted validation and Ollama HTTP infra, but are not fully service
-  commands yet.
-- There is no persistent job record for downloads or deletes.
+- Model pull still awaits command completion, but progress is visible through
+  job events while the command runs.
+- Model pull cancellation is checked between blocking stream reads, so a stalled
+  read may delay cancellation.
+- Model delete still has command-level orchestration in `lib.rs` and no job
+  record.
+- Chat generation still uses `GenerationTasks` keyed by `chat_id`; it has not
+  moved to the job system yet.
 
 ## Search Behavior
 
@@ -387,6 +463,7 @@ Current limitations:
 - Ollama readiness status and readiness loading state.
 - Ollama models and selected model.
 - Model panel visibility and model action state.
+- Recent job records from `list_jobs` and `job_updated` events.
 - Export menu visibility and active export format.
 - Command palette state, command query, active command index, command registry,
   fuzzy filtering, and disabled command reasons.
@@ -399,6 +476,8 @@ Existing stale-state guards:
 - Startup chat/model loads use local `ignore` flags in effects.
 - Message loading for active chat uses an effect-level `ignore` flag.
 - Chat search debounces for 180 ms and uses an `ignore` flag.
+- Job event handling upserts jobs by `job_id`, so stale events cannot overwrite
+  unrelated jobs.
 - `activeChatIdRef` guards against appending/reloading assistant messages into a
   chat that is no longer active.
 - `respondingChatId` scopes the visible progress indicator and cancellation.
@@ -419,6 +498,10 @@ The active chat action group includes an export menu. Export rendering is
 backend-owned through `export_chat`; the frontend turns the returned content
 into a local browser/WebView download. No dialog plugin or additional Tauri
 capability has been added.
+
+The job status surface shows active jobs and failed jobs. Model pull jobs show
+their label, status, progress bytes when Ollama reports totals, readable errors,
+and a cancel action that calls `cancel_job(job_id)`.
 
 The first-run readiness surface handles:
 
@@ -478,7 +561,7 @@ The frontend suppresses that cancellation message in the active chat error UI.
 - Cancellation depends on checking a flag between blocking stream reads.
 - Failed runs with no assistant text are persisted but only surface as inline
   `historyError` in the current UI.
-- Model downloads have no progress or cancellation path.
+- Model delete still has no progress or cancellation path.
 - Search uses `LIKE`, so result quality and scalability are limited.
 - Raw error strings are shown directly in most UI surfaces.
 
@@ -490,6 +573,9 @@ repeatable `generation_runs` schema extension. Chunk 4 adds `export_chat`
 without adding a dialog plugin or changing Tauri permissions. Chunk 5 starts the
 backend service-layer migration with model listing/status and validation only;
 command names and serialized model/status fields stay unchanged.
+Chunk 6 adds the persistent `jobs` table, `job_updated` events, `list_jobs`,
+`cancel_job`, and a streamed `model_pull` job behind `download_ollama_model`.
+Chat generation remains on its existing cancellation path for now.
 
 Relevant checks:
 
