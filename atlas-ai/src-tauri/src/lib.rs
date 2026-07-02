@@ -3,10 +3,12 @@ mod domain;
 mod infra;
 
 use app::{
-    benchmarks as benchmark_service, jobs as job_service, knowledge as knowledge_service,
-    memories as memory_service, models as model_service, summaries as summary_service,
+    benchmarks as benchmark_service, context as context_service, jobs as job_service,
+    knowledge as knowledge_service, memories as memory_service, models as model_service,
+    summaries as summary_service,
 };
 use domain::benchmark::{ModelBenchmark, ModelUsage};
+use domain::context::GenerationContextItem;
 use domain::database::DatabaseDiagnostics;
 use domain::job::{Job, JobEvent, JobStatus, JobType};
 use domain::knowledge::{
@@ -18,7 +20,7 @@ use domain::model::{validate_ollama_model_name, OllamaModel, OllamaStatus};
 use domain::search::ChatSearchResult;
 use domain::summary::{ConversationSummary, SummarySourceMessage};
 use infra::{
-    benchmarks::CompletedBenchmarkMetrics, jobs as job_repository,
+    benchmarks::CompletedBenchmarkMetrics, context as context_repository, jobs as job_repository,
     knowledge as knowledge_repository, memories as memory_repository, ollama, search, sqlite,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -100,6 +102,7 @@ struct GenerationRun {
     error_message: Option<String>,
     memory_uses: Vec<PromptMemoryUse>,
     document_sources: Vec<GenerationDocumentSourceUse>,
+    context_items: Vec<GenerationContextItem>,
 }
 
 #[derive(Copy, Clone, Debug, Deserialize, PartialEq)]
@@ -581,88 +584,6 @@ fn build_summary_prompt_messages(messages: &[SummarySourceMessage]) -> Vec<Ollam
             ),
         },
     ]
-}
-
-fn summary_prompt_context(summary: &ConversationSummary) -> OllamaChatMessage {
-    OllamaChatMessage {
-        role: "system".to_string(),
-        content: format!(
-            "The user enabled this conversation summary for prompt context. Use it only as a transparent aid for this chat; the full visible message history follows.\n\nConversation summary v{} covering messages {}-{}:\n{}",
-            summary.version,
-            summary
-                .source_message_start_id
-                .map_or_else(|| "unknown".to_string(), |id| id.to_string()),
-            summary
-                .source_message_end_id
-                .map_or_else(|| "unknown".to_string(), |id| id.to_string()),
-            summary.summary
-        ),
-    }
-}
-
-fn memory_prompt_context(memories: &[Memory]) -> OllamaChatMessage {
-    let mut content = String::from(
-        "The user enabled these Atlas memories for this chat. Treat them as user-owned context, not hidden model memory. Use them only when relevant, and do not invent additional memories.\n\n",
-    );
-
-    for (index, memory) in memories.iter().enumerate() {
-        let scope = match memory.scope_type {
-            MemoryScopeType::Global => "global".to_string(),
-            MemoryScopeType::Conversation => memory.scope_id.as_ref().map_or_else(
-                || "conversation".to_string(),
-                |scope_id| format!("conversation:{scope_id}"),
-            ),
-            MemoryScopeType::Project => memory.scope_id.as_ref().map_or_else(
-                || "project".to_string(),
-                |scope_id| format!("project:{scope_id}"),
-            ),
-        };
-        let pinned = if memory.pinned { " pinned" } else { "" };
-        content.push_str(&format!(
-            "{}. [{}{}] {}\n",
-            index + 1,
-            scope,
-            pinned,
-            memory.content
-        ));
-    }
-
-    OllamaChatMessage {
-        role: "system".to_string(),
-        content,
-    }
-}
-
-fn document_prompt_context(sources: &[GenerationDocumentSourceUse]) -> OllamaChatMessage {
-    let mut content = String::from(
-        "The user enabled Atlas local knowledge for this chat. Answer from the provided source excerpts when they are relevant. Cite sources with their bracketed IDs like [S1]. Do not invent citations. If these sources are insufficient, say that the indexed sources do not contain enough information.\n\n",
-    );
-
-    for source in sources {
-        content.push_str(&format!(
-            "[{}] {} lines {}-{} (document_id={}, chunk_id={})\n{}\n\n",
-            source.source_id,
-            source.file_name,
-            source.start_line,
-            source.end_line,
-            source.document_id.as_deref().unwrap_or("unknown"),
-            source.chunk_id.as_deref().unwrap_or("unknown"),
-            source.content
-        ));
-    }
-
-    OllamaChatMessage {
-        role: "system".to_string(),
-        content,
-    }
-}
-
-fn latest_user_query(messages: &[ChatMessage]) -> Option<String> {
-    messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user")
-        .map(|message| message.content.clone())
 }
 
 fn update_conversation_summary_progress(
@@ -1495,6 +1416,7 @@ fn read_generation_run(
             error_message: row.get(offset + 15)?,
             memory_uses: Vec::new(),
             document_sources: Vec::new(),
+            context_items: Vec::new(),
         }),
         None => None,
     })
@@ -1736,6 +1658,7 @@ fn list_messages_for_chat(
             run.memory_uses = memory_repository::list_generation_uses(conn, &run.id)?;
             run.document_sources =
                 knowledge_repository::list_generation_source_uses(conn, &run.id)?;
+            run.context_items = context_repository::list_generation_context_items(conn, &run.id)?;
         }
     }
 
@@ -1803,6 +1726,7 @@ fn read_generation_run_required(row: &Row<'_>) -> Result<GenerationRun, rusqlite
         error_message: row.get(15)?,
         memory_uses: Vec::new(),
         document_sources: Vec::new(),
+        context_items: Vec::new(),
     })
 }
 
@@ -2989,7 +2913,12 @@ async fn generate_assistant_response(
             Vec::new()
         };
         let knowledge_setting = knowledge_service::prompt_setting(&conn, &chat_id)?;
-        let knowledge_query = latest_user_query(&messages).unwrap_or_default();
+        let knowledge_query = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
         (
             messages,
             prompt_summary,
@@ -3031,29 +2960,64 @@ async fn generate_assistant_response(
     } else {
         Vec::new()
     };
-    let mut ollama_messages = Vec::with_capacity(
-        messages.len()
-            + usize::from(prompt_summary.is_some())
-            + usize::from(!prompt_memories.is_empty()),
-    );
-    if let Some(summary) = prompt_summary {
-        ollama_messages.push(summary_prompt_context(&summary));
-    }
-    if !prompt_memories.is_empty() {
-        ollama_messages.push(memory_prompt_context(&prompt_memories));
-    }
-    if !document_sources.is_empty() {
-        ollama_messages.push(document_prompt_context(&document_sources));
-    } else if prompt_knowledge_enabled {
-        ollama_messages.push(OllamaChatMessage {
-            role: "system".to_string(),
-            content: "The user enabled Atlas local knowledge for this chat, but no matching indexed source chunks were retrieved for this message. Do not invent file citations; if the answer depends on local files, say the indexed sources do not contain enough information.".to_string(),
-        });
-    }
-    ollama_messages.extend(messages.into_iter().map(|message| OllamaChatMessage {
-        role: message.role,
-        content: message.content,
-    }));
+    let assembled_context = match context_service::assemble(context_service::AssemblyInput {
+        model_name: &model,
+        messages: &messages,
+        prompt_summary: prompt_summary.as_ref(),
+        prompt_memories: &prompt_memories,
+        document_sources: &document_sources,
+        knowledge_enabled: prompt_knowledge_enabled,
+    }) {
+        Ok(assembled_context) => assembled_context,
+        Err(error) => {
+            let completion = GenerationCompletion {
+                first_token_at: None,
+                completed_at: now_millis()?,
+                status: "failed",
+                metadata: GenerationMetadata::default(),
+                error_message: Some(error.clone()),
+            };
+            let conn = store
+                .conn
+                .lock()
+                .map_err(|_| "Database lock was poisoned".to_string())?;
+            update_generation_run(&conn, &run_id, None, &completion)?;
+            return Err(error);
+        }
+    };
+    let context_items = {
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        match context_service::record_generation_context(
+            &conn,
+            &run_id,
+            &assembled_context.items,
+            started_at,
+        ) {
+            Ok(context_items) => context_items,
+            Err(error) => {
+                let completion = GenerationCompletion {
+                    first_token_at: None,
+                    completed_at: now_millis()?,
+                    status: "failed",
+                    metadata: GenerationMetadata::default(),
+                    error_message: Some(error.clone()),
+                };
+                update_generation_run(&conn, &run_id, None, &completion)?;
+                return Err(error);
+            }
+        }
+    };
+    let ollama_messages = assembled_context
+        .messages
+        .into_iter()
+        .map(|message| OllamaChatMessage {
+            role: message.role,
+            content: message.content,
+        })
+        .collect::<Vec<_>>();
     let cancellation = Arc::new(AtomicBool::new(false));
 
     {
@@ -3121,6 +3085,7 @@ async fn generate_assistant_response(
             let mut run = update_generation_run(&conn, &run_id, Some(message.id), &completion)?;
             run.memory_uses = memory_uses;
             run.document_sources = document_sources;
+            run.context_items = context_items;
             message.generation_run = Some(run);
             Ok(message)
         }
@@ -3170,6 +3135,7 @@ async fn generate_assistant_response(
                 Ok(mut run) => {
                     run.memory_uses = memory_uses;
                     run.document_sources = document_sources;
+                    run.context_items = context_items;
                     run
                 }
                 Err(update_error) => {
@@ -3276,8 +3242,8 @@ mod tests {
     };
 
     use super::app::{
-        benchmarks as benchmark_service, jobs as job_service, knowledge as knowledge_service,
-        memories as memory_service, summaries as summary_service,
+        benchmarks as benchmark_service, context as context_service, jobs as job_service,
+        knowledge as knowledge_service, memories as memory_service, summaries as summary_service,
     };
     use super::domain::benchmark::ModelBenchmarkStatus;
     use super::domain::job::{JobStatus, JobType};
@@ -3288,8 +3254,8 @@ mod tests {
     use super::domain::search::SearchResultSource;
     use super::infra::{
         benchmarks::{self as benchmark_repository, CompletedBenchmarkMetrics},
-        jobs as job_repository, knowledge as knowledge_repository, memories as memory_repository,
-        search, sqlite,
+        context as context_repository, jobs as job_repository, knowledge as knowledge_repository,
+        memories as memory_repository, search, sqlite,
     };
     use super::{
         calculate_tokens_per_second, create_generation_run, escape_like_pattern,
@@ -3433,6 +3399,7 @@ mod tests {
                     error_message: Some("Generation failed".to_string()),
                     memory_uses: Vec::new(),
                     document_sources: Vec::new(),
+                    context_items: Vec::new(),
                 }),
             },
         ];
@@ -3705,6 +3672,76 @@ mod tests {
     }
 
     #[test]
+    fn context_service_persists_ordered_generation_items() {
+        let conn = Connection::open_in_memory().unwrap();
+        sqlite::setup_database(&conn).unwrap();
+        conn.execute(
+            "
+            INSERT INTO chats (id, title, created_at, updated_at)
+            VALUES ('chat-1', 'Context Check', 100, 100)
+            ",
+            [],
+        )
+        .unwrap();
+
+        let messages = vec![
+            ChatMessage {
+                id: 1,
+                chat_id: "chat-1".to_string(),
+                role: "user".to_string(),
+                content: "Earlier question".to_string(),
+                created_at: 125,
+                generation_run: None,
+            },
+            ChatMessage {
+                id: 2,
+                chat_id: "chat-1".to_string(),
+                role: "assistant".to_string(),
+                content: "Earlier answer".to_string(),
+                created_at: 150,
+                generation_run: None,
+            },
+            ChatMessage {
+                id: 3,
+                chat_id: "chat-1".to_string(),
+                role: "user".to_string(),
+                content: "What context was used?".to_string(),
+                created_at: 175,
+                generation_run: None,
+            },
+        ];
+        let run_id = create_generation_run(&conn, "chat-1", "llama3.2:3b", 200).unwrap();
+        let assembled = context_service::assemble(context_service::AssemblyInput {
+            model_name: "llama3.2:3b",
+            messages: &messages,
+            prompt_summary: None,
+            prompt_memories: &[],
+            document_sources: &[],
+            knowledge_enabled: false,
+        })
+        .unwrap();
+        let saved_items =
+            context_service::record_generation_context(&conn, &run_id, &assembled.items, 200)
+                .unwrap();
+        let listed_items =
+            context_repository::list_generation_context_items(&conn, &run_id).unwrap();
+
+        assert_eq!(saved_items.len(), listed_items.len());
+        assert!(listed_items
+            .iter()
+            .any(|item| item.item_type.as_str() == "system_prompt"));
+        assert!(listed_items.iter().any(|item| {
+            item.item_type.as_str() == "user_message" && item.item_id.as_deref() == Some("3")
+        }));
+        assert!(listed_items
+            .iter()
+            .any(|item| item.item_type.as_str() == "model_options"));
+        assert!(listed_items
+            .windows(2)
+            .all(|items| items[0].order_index <= items[1].order_index));
+    }
+
+    #[test]
     fn knowledge_service_indexes_searches_and_records_sources() {
         let conn = Connection::open_in_memory().unwrap();
         sqlite::setup_database(&conn).unwrap();
@@ -3829,7 +3866,7 @@ mod tests {
         sqlite::setup_database(&conn).unwrap();
         let diagnostics = sqlite::diagnostics(&conn, &db_path).unwrap();
 
-        assert_eq!(diagnostics.user_version, 6);
+        assert_eq!(diagnostics.user_version, 7);
         assert_eq!(diagnostics.journal_mode, "wal");
         assert_eq!(diagnostics.integrity_check, "ok");
         assert!(diagnostics
@@ -3881,6 +3918,9 @@ mod tests {
             .any(|table| table.table_name == "retrieval_runs" && table.row_count == 0));
         assert!(diagnostics.table_counts.iter().any(|table| {
             table.table_name == "generation_document_sources" && table.row_count == 0
+        }));
+        assert!(diagnostics.table_counts.iter().any(|table| {
+            table.table_name == "generation_context_items" && table.row_count == 0
         }));
 
         drop(conn);

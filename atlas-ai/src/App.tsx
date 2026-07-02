@@ -46,6 +46,7 @@ import {
   type ConversationSummary,
   type DatabaseDiagnostics,
   type DocumentSearchResult,
+  type GenerationContextItem,
   type GenerationDocumentSourceUse,
   type GenerationRun,
   type Job,
@@ -302,6 +303,78 @@ function generationStatusLabel(status: GenerationRun['status']) {
   }
 }
 
+function contextItemTypeLabel(itemType: GenerationContextItem['item_type']) {
+  switch (itemType) {
+    case 'system_prompt':
+      return 'System'
+    case 'summary':
+      return 'Summary'
+    case 'memory':
+      return 'Memory'
+    case 'prior_message':
+      return 'Prior message'
+    case 'document_chunk':
+      return 'Document chunk'
+    case 'user_message':
+      return 'User message'
+    case 'model_options':
+      return 'Model options'
+    case 'truncation_notice':
+      return 'Truncation'
+  }
+}
+
+function parseContextMetadata(item: GenerationContextItem) {
+  if (!item.metadata_json) {
+    return null
+  }
+
+  try {
+    const value = JSON.parse(item.metadata_json) as Record<string, unknown>
+    return value
+  } catch {
+    return null
+  }
+}
+
+function contextMetadataLine(item: GenerationContextItem) {
+  const metadata = parseContextMetadata(item)
+  if (!metadata) {
+    return null
+  }
+
+  if (typeof metadata.hash === 'string') {
+    return `Hash ${metadata.hash}`
+  }
+
+  if (typeof metadata.model === 'string') {
+    return `Model ${metadata.model}`
+  }
+
+  if (typeof metadata.source_id === 'string') {
+    return `Source ${metadata.source_id}`
+  }
+
+  if (typeof metadata.omitted_prior_message_count === 'string') {
+    return `${metadata.omitted_prior_message_count} omitted`
+  }
+
+  if (typeof metadata.preview === 'string') {
+    return metadata.preview
+  }
+
+  return null
+}
+
+function getContextPromptEstimate(run: GenerationRun) {
+  const total = run.context_items.reduce(
+    (sum, item) => sum + item.token_count_estimate,
+    0,
+  )
+
+  return total > 0 ? total : null
+}
+
 function MessageDiagnostics({
   run,
   onOpenSource,
@@ -319,6 +392,7 @@ function MessageDiagnostics({
     ['Total', formatDurationMs(run.total_duration_ms)],
     ['First token', formatDurationMs(getTimeToFirstToken(run))],
     ['Prompt', formatCount(run.prompt_eval_count)],
+    ['Context est.', formatCount(getContextPromptEstimate(run))],
     ['Completion', formatCount(run.eval_count)],
     ['Speed', formatTokensPerSecond(run.tokens_per_second)],
     ['Load', formatDurationMs(run.load_duration_ms)],
@@ -341,6 +415,47 @@ function MessageDiagnostics({
       </dl>
       {run.error_message ? (
         <p className="mt-2 break-words text-zinc-400">{run.error_message}</p>
+      ) : null}
+      {run.context_items.length > 0 ? (
+        <div className="mt-3 border-t border-zinc-800/80 pt-2">
+          <p className="text-zinc-400">
+            Prompt context: {run.context_items.length} items
+          </p>
+          <div className="mt-2 grid gap-1.5">
+            {run.context_items.map((item) => {
+              const metadataLine = contextMetadataLine(item)
+
+              return (
+                <div
+                  className={`rounded-lg px-2 py-1.5 ${
+                    item.item_type === 'truncation_notice'
+                      ? 'bg-amber-950/20 text-amber-100'
+                      : 'bg-zinc-950 text-zinc-400'
+                  }`}
+                  key={item.id}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="min-w-0 break-words text-zinc-300">
+                      {item.label}
+                    </p>
+                    <span className="flex-none rounded bg-zinc-900 px-1.5 py-0.5 text-[10px] text-zinc-500">
+                      {contextItemTypeLabel(item.item_type)}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-[11px] text-zinc-600">
+                    {item.token_count_estimate.toLocaleString()} est. tokens
+                    {item.item_id ? ` - ${item.item_id}` : ''}
+                  </p>
+                  {metadataLine ? (
+                    <p className="mt-1 break-words text-[11px] text-zinc-500">
+                      {truncateText(metadataLine, 220)}
+                    </p>
+                  ) : null}
+                </div>
+              )
+            })}
+          </div>
+        </div>
       ) : null}
       {run.memory_uses.length > 0 ? (
         <div className="mt-3 border-t border-zinc-800/80 pt-2">

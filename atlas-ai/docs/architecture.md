@@ -15,18 +15,20 @@ Tailwind CSS, SQLite, and Ollama. The current codebase is intentionally compact:
   cancellation still live in `src-tauri/src/lib.rs`.
 - Backend service slices now include model management, jobs, database
   setup/diagnostics, FTS search, model benchmarks, summaries, memories, and
-  local knowledge indexing:
+  local knowledge indexing, and generation context assembly:
   `src-tauri/src/domain/model.rs`, `src-tauri/src/app/models.rs`,
   `src-tauri/src/domain/job.rs`, `src-tauri/src/app/jobs.rs`,
   `src-tauri/src/domain/benchmark.rs`, `src-tauri/src/app/benchmarks.rs`,
   `src-tauri/src/domain/summary.rs`, `src-tauri/src/app/summaries.rs`,
   `src-tauri/src/domain/memory.rs`, `src-tauri/src/app/memories.rs`,
   `src-tauri/src/domain/knowledge.rs`, `src-tauri/src/app/knowledge.rs`,
+  `src-tauri/src/domain/context.rs`, `src-tauri/src/app/context.rs`,
   `src-tauri/src/infra/jobs.rs`, `src-tauri/src/domain/database.rs`,
   `src-tauri/src/domain/search.rs`, `src-tauri/src/infra/search.rs`,
   `src-tauri/src/infra/benchmarks.rs`, `src-tauri/src/infra/summaries.rs`,
   `src-tauri/src/infra/memories.rs`, `src-tauri/src/infra/knowledge.rs`,
-  `src-tauri/src/infra/sqlite.rs`, and `src-tauri/src/infra/ollama.rs`.
+  `src-tauri/src/infra/context.rs`, `src-tauri/src/infra/sqlite.rs`, and
+  `src-tauri/src/infra/ollama.rs`.
 - `src-tauri/src/main.rs` only starts `atlas_lib::run()`.
 - Public release docs are `README.md` and `CHANGELOG.md`.
 
@@ -180,6 +182,7 @@ GenerationRun
 - error_message: string | null
 - memory_uses: PromptMemoryUse[]
 - document_sources: GenerationDocumentSourceUse[]
+- context_items: GenerationContextItem[]
 
 ChatExportFormat
 - "markdown" | "json" | "plain_text"
@@ -361,6 +364,17 @@ GenerationDocumentSourceUse
 - score: number
 - used_at: number
 
+GenerationContextItem
+- id: string
+- generation_run_id: string
+- item_type: "system_prompt" | "summary" | "memory" | "prior_message" | "document_chunk" | "user_message" | "model_options" | "truncation_notice"
+- item_id: string | null
+- label: string
+- token_count_estimate: number
+- order_index: number
+- metadata_json: string | null
+- created_at: number
+
 ModelBenchmark
 - id: string
 - job_id: string
@@ -410,7 +424,8 @@ the current schema as `PRAGMA user_version = 4`. Chunk 11 adds transparent
 memory tables and records the current schema as `PRAGMA user_version = 5`.
 Chunk 12 adds local knowledge workspace, document, chunk, FTS, prompt setting,
 retrieval run, and generation source snapshot tables and records the current
-schema as `PRAGMA user_version = 6`.
+schema as `PRAGMA user_version = 6`. Chunk 13 adds generation context item
+metadata and records the current schema as `PRAGMA user_version = 7`.
 
 There is no migrations directory yet. Future schema changes should add
 idempotent versions after the v1 baseline instead of editing historical setup in
@@ -672,6 +687,27 @@ CREATE TABLE IF NOT EXISTS generation_document_sources (
   score REAL NOT NULL,
   used_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS generation_context_items (
+  id TEXT PRIMARY KEY,
+  generation_run_id TEXT NOT NULL REFERENCES generation_runs(id) ON DELETE CASCADE,
+  item_type TEXT NOT NULL CHECK(item_type IN (
+    'system_prompt',
+    'summary',
+    'memory',
+    'prior_message',
+    'document_chunk',
+    'user_message',
+    'model_options',
+    'truncation_notice'
+  )),
+  item_id TEXT,
+  label TEXT NOT NULL,
+  token_count_estimate INTEGER NOT NULL,
+  order_index INTEGER NOT NULL,
+  metadata_json TEXT,
+  created_at INTEGER NOT NULL
+);
 ```
 
 Current indexes and triggers:
@@ -740,6 +776,9 @@ CREATE INDEX IF NOT EXISTS idx_retrieval_runs_conversation
 
 CREATE INDEX IF NOT EXISTS idx_generation_document_sources_run
   ON generation_document_sources(generation_run_id, source_id ASC);
+
+CREATE INDEX IF NOT EXISTS idx_generation_context_items_run
+  ON generation_context_items(generation_run_id, order_index ASC);
 
 CREATE TRIGGER IF NOT EXISTS messages_after_insert_update_chat
 AFTER INSERT ON messages
@@ -811,6 +850,16 @@ Persistence behavior:
 - Prompt assembly adds retrieved document chunks only when knowledge is enabled
   for the active chat. The model is instructed to cite source IDs like `[S1]`
   and to avoid invented citations when indexed sources are insufficient.
+- `generation_context_items` stores an ordered metadata record of the prompt
+  context assembled for each generation run. It records item type, stable source
+  ID when applicable, label, rough token estimate, order, and compact metadata
+  such as hashes or previews. It does not store hidden chain-of-thought or dump
+  giant raw prompts into the UI.
+- Context assembly now has one backend service path. It orders system prompt,
+  summary, memories, selected prior messages, retrieved document chunks, current
+  user message, and model options. Older prior messages are omitted when needed
+  to stay under a conservative token estimate, and truncation is recorded as an
+  explicit context item.
 - During startup, queued/running/cancelling jobs from a previous process are
   marked `failed` with an interruption message so stale jobs do not remain
   cancellable forever.
@@ -821,8 +870,8 @@ Persistence behavior:
 - `get_database_diagnostics` reads the database path, database/WAL/SHM sizes,
   journal mode, schema user version, page counts, free pages, integrity check,
   and table counts for core tables, FTS tables, benchmark tables, summary
-  tables, and memory tables. It does not export chat content or mutate user
-  data.
+  tables, memory tables, knowledge tables, and context item tables. It does not
+  export chat content or mutate user data.
 
 ## Chat Generation Flow
 
@@ -837,12 +886,11 @@ The user flow starts in `src/App.tsx`:
 5. `add_message` persists the user message.
 6. The frontend refreshes chat summaries.
 7. `generate_assistant_response` is called with `chatId` and `model`.
-8. If the active conversation summary exists and `enabled_for_prompt` is true,
-   the backend prepends it as an explicit system context block before the
-   visible chat messages.
-9. If memory use is enabled for the chat, the backend loads active global and
-   conversation-scoped memories, snapshots them to `generation_memory_uses`,
-   and prepends them as an explicit system context block.
+8. The backend assembles an explicit context record for the generation,
+   including enabled summary, memories, retrieved chunks, selected prior
+   messages, current user message, and model request metadata.
+9. Message diagnostics show the ordered context items, rough prompt estimate,
+   visible memory/source use, and any intentional truncation notices.
 10. When the command resolves, the frontend appends the assistant message only if
    the active chat still matches the generating chat.
 11. The frontend reloads messages and refreshes chat summaries.
@@ -856,23 +904,27 @@ The backend generation path:
 4. Loads active prompt memories only if `memory_prompt_settings` is enabled for
    this chat. Active prompt memories are unarchived global memories plus
    unarchived conversation memories scoped to the chat.
-5. Creates a `generation_runs` row with status `running`.
-6. Snapshots any prompt memories into `generation_memory_uses` for diagnostics.
-7. Converts the optional summary, optional memory context, and all visible
-   messages to Ollama chat messages. Summary and memory context blocks both
-   state that the user enabled them.
-8. Registers a cancellation flag in `GenerationTasks` keyed by `chat_id`.
-9. Runs blocking Ollama streaming work on Tauri's blocking runtime.
-10. Calls `POST http://127.0.0.1:11434/api/chat` with `stream: true`.
-11. Reads Ollama JSONL chunks, accumulates `message.content`, tracks first
+5. Loads and snapshots retrieved knowledge chunks only if
+   `knowledge_prompt_settings` is enabled for this chat.
+6. Creates a `generation_runs` row with status `running`.
+7. Snapshots any prompt memories into `generation_memory_uses` for diagnostics.
+8. Assembles context through `app::context::assemble()`. The assembler adds the
+   Atlas system prompt, enabled summary, enabled memories, budgeted prior
+   messages, retrieved source chunks, the current user message, and model
+   options metadata. Long history is truncated intentionally and recorded.
+9. Persists ordered `generation_context_items` before streaming starts.
+10. Registers a cancellation flag in `GenerationTasks` keyed by `chat_id`.
+11. Runs blocking Ollama streaming work on Tauri's blocking runtime.
+12. Calls `POST http://127.0.0.1:11434/api/chat` with `stream: true`.
+13. Reads Ollama JSONL chunks, accumulates `message.content`, tracks first
    non-empty token time, and captures optional final Ollama metadata:
    `total_duration`, `load_duration`, `prompt_eval_count`,
    `prompt_eval_duration`, `eval_count`, and `eval_duration`.
-12. Converts Ollama nanosecond durations into rounded milliseconds and calculates
+14. Converts Ollama nanosecond durations into rounded milliseconds and calculates
    tokens/sec from `eval_count / eval_duration`.
-13. Inserts an assistant message and associates it with the generation run when
+15. Inserts an assistant message and associates it with the generation run when
     final or partial assistant text exists.
-14. Finalizes the generation run as `completed`, `cancelled`, or `failed`.
+16. Finalizes the generation run as `completed`, `cancelled`, or `failed`.
 
 Important current limitation: chat is streamed from Ollama to Rust, but not
 token-streamed from Rust to React. React shows animated progress dots while
@@ -1208,15 +1260,15 @@ The frontend suppresses that cancellation message in the active chat error UI.
   commands have typed wrappers.
 - The command registry is centralized in `src/App.tsx`, but it is still coupled
   to local component state and handlers until frontend feature modules exist.
-- Schema setup records current user version 5, but there is not yet an
+- Schema setup records current user version 7, but there is not yet an
   incremental migrations directory for future versions.
 - The SQLite connection is protected by one mutex, so long database work would
   block other database operations.
 - Database diagnostics are a focused modal, not the full diagnostics center
   planned for later chunks.
-- Chat generation still sends the full conversation every time. The only prompt
-  assembly behavior today is optional user-enabled summary and memory system
-  context; there is no broader context diagnostics surface yet.
+- Chat generation now has explicit context assembly and diagnostics, but the
+  assembler is still owned from `lib.rs` command flow rather than a dedicated
+  command module.
 - The generation task registry is in-memory and keyed only by chat ID.
 - Cancellation depends on checking a flag between blocking stream reads.
 - Failed runs with no assistant text are persisted but only surface as inline

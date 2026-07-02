@@ -24,6 +24,7 @@ export type GenerationRun = {
   error_message: string | null
   memory_uses: PromptMemoryUse[]
   document_sources: GenerationDocumentSourceUse[]
+  context_items: GenerationContextItem[]
 }
 
 export type ChatMessage = {
@@ -261,6 +262,28 @@ export type GenerationDocumentSourceUse = {
   content: string
   score: number
   used_at: number
+}
+
+export type GenerationContextItemType =
+  | 'system_prompt'
+  | 'summary'
+  | 'memory'
+  | 'prior_message'
+  | 'document_chunk'
+  | 'user_message'
+  | 'model_options'
+  | 'truncation_notice'
+
+export type GenerationContextItem = {
+  id: string
+  generation_run_id: string
+  item_type: GenerationContextItemType
+  item_id: string | null
+  label: string
+  token_count_estimate: number
+  order_index: number
+  metadata_json: string | null
+  created_at: number
 }
 
 export type ModelBenchmarkStatus =
