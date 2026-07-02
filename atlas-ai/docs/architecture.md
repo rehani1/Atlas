@@ -23,6 +23,10 @@ feature folders, Rust `commands`, `app`, `domain`, or `infra` modules, database
 migration files, job tables, event envelopes, diagnostics views, document
 indexing, memory, export, or model benchmark surfaces yet.
 
+`src/App.tsx` now also owns a small frontend-only command registry and
+`Cmd/Ctrl+K` command palette. The registry uses stable command IDs and routes
+enabled commands to the same local handlers used by the visible UI controls.
+
 ## Tooling
 
 The app directory is `atlas-ai/`. Existing scripts and checks are:
@@ -64,6 +68,7 @@ React owns UI and interaction state:
 - Composer draft.
 - Model selection.
 - Search input/results.
+- Command palette visibility, query, and active result.
 - Loading and error states.
 - Browser-preview fallback behavior when Tauri is unavailable.
 
@@ -354,6 +359,8 @@ Current limitations:
 - Ollama readiness status and readiness loading state.
 - Ollama models and selected model.
 - Model panel visibility and model action state.
+- Command palette state, command query, active command index, command registry,
+  fuzzy filtering, and disabled command reasons.
 - Generation state, including `isResponding` and `respondingChatId`.
 - Deleting chat state.
 - Chat search panel state, query, loading state, results, and errors.
@@ -369,6 +376,14 @@ Existing stale-state guards:
 
 Browser preview behavior is explicit: when not running in Tauri, chat responses
 and model management show limited frontend-only states instead of calling Rust.
+
+The command palette opens with `Cmd/Ctrl+K`, focuses its search field, supports
+arrow/enter keyboard selection, and closes on escape or backdrop click. Initial
+enabled commands call existing handlers for new chat, chat search, model manager
+open, model refresh, model selection, recommended model downloads, and active
+chat deletion when valid. Future surfaces such as settings, chat export,
+diagnostics, Model Lab, and folder indexing are represented as disabled commands
+with visible reasons instead of placeholder business logic.
 
 The first-run readiness surface handles:
 
@@ -414,6 +429,8 @@ The frontend suppresses that cancellation message in the active chat error UI.
   HTTP, streaming, cancellation, and Tauri command handlers.
 - The frontend still calls many chat/search `invoke()` commands directly from
   `src/App.tsx`; only the touched Ollama/model commands have typed wrappers.
+- The command registry is centralized in `src/App.tsx`, but it is still coupled
+  to local component state and handlers until frontend feature modules exist.
 - The schema is inline and repeatable, but not versioned.
 - The SQLite connection is protected by one mutex, so long database work would
   block other database operations.

@@ -1,5 +1,11 @@
 import { invoke } from '@tauri-apps/api/core'
-import { type FormEvent, useEffect, useRef, useState } from 'react'
+import {
+  type FormEvent,
+  type KeyboardEvent,
+  useEffect,
+  useRef,
+  useState,
+} from 'react'
 import {
   deleteOllamaModel,
   downloadOllamaModel,
@@ -25,6 +31,49 @@ type ChatSummary = {
 type UiError = {
   message: string
   details?: string
+}
+
+type CommandId =
+  | 'chat.new'
+  | 'chat.search'
+  | 'chat.delete_active'
+  | 'model.manager.open'
+  | 'model.refresh'
+  | 'model.switch.open'
+  | `model.switch:${string}`
+  | `model.download:${string}`
+  | 'settings.open'
+  | 'chat.export_current'
+  | 'diagnostics.open'
+  | 'model_lab.open'
+  | 'knowledge.index_folder'
+
+type AppCommand = {
+  id: CommandId
+  title: string
+  category: 'Chat' | 'Model' | 'App' | 'Knowledge'
+  description?: string
+  disabledReason?: string
+  keywords?: string[]
+  run: () => void | Promise<void>
+}
+
+type CommandRegistryContext = {
+  activeChatId: string | null
+  deletingChatId: string | null
+  isDesktop: boolean
+  isOllamaStatusLoading: boolean
+  modelAction: string | null
+  ollamaModels: OllamaModel[]
+  ollamaStatus: OllamaStatus | null
+  selectedModel: string
+  onDeleteActiveChat: () => Promise<void>
+  onDownloadModel: (model: string) => Promise<void>
+  onNewChat: () => Promise<void>
+  onOpenChatSearch: () => void
+  onOpenModelManager: () => void
+  onRefreshModels: () => Promise<void>
+  onSelectModel: (model: string) => void
 }
 
 declare global {
@@ -270,6 +319,252 @@ function getChatBlockReason(status: OllamaStatus | null, selectedModel: string) 
   return null
 }
 
+function getRefreshModelsDisabledReason(context: CommandRegistryContext) {
+  if (!context.isDesktop) {
+    return 'Model refresh requires the Tauri desktop app.'
+  }
+
+  if (context.modelAction !== null) {
+    return 'Finish the current model action first.'
+  }
+
+  if (context.isOllamaStatusLoading) {
+    return 'Model status is already refreshing.'
+  }
+
+  return undefined
+}
+
+function getDownloadModelDisabledReason(
+  context: CommandRegistryContext,
+  modelName: string,
+) {
+  if (context.ollamaModels.some((model) => model.name === modelName)) {
+    return 'Already installed.'
+  }
+
+  if (!context.isDesktop) {
+    return 'Model downloads require the Tauri desktop app.'
+  }
+
+  if (context.modelAction !== null) {
+    return 'Finish the current model action first.'
+  }
+
+  if (context.isOllamaStatusLoading) {
+    return 'Wait for model status to finish refreshing.'
+  }
+
+  if (context.ollamaStatus?.status === 'unavailable') {
+    return 'Ollama is offline.'
+  }
+
+  return undefined
+}
+
+function buildCommandRegistry(context: CommandRegistryContext): AppCommand[] {
+  const commands: AppCommand[] = [
+    {
+      id: 'chat.new',
+      title: 'New chat',
+      category: 'Chat',
+      description: 'Start a blank conversation.',
+      keywords: ['conversation', 'clear'],
+      run: context.onNewChat,
+    },
+    {
+      id: 'chat.search',
+      title: 'Search chats',
+      category: 'Chat',
+      description: 'Search saved conversations.',
+      keywords: ['find', 'history'],
+      run: context.onOpenChatSearch,
+    },
+    {
+      id: 'chat.delete_active',
+      title: 'Delete current chat',
+      category: 'Chat',
+      description: 'Remove the open conversation.',
+      disabledReason: context.activeChatId
+        ? context.deletingChatId === context.activeChatId
+          ? 'Current chat is already being deleted.'
+          : undefined
+        : 'Open a chat before deleting.',
+      keywords: ['remove conversation'],
+      run: context.onDeleteActiveChat,
+    },
+    {
+      id: 'model.manager.open',
+      title: 'Open model manager',
+      category: 'Model',
+      description: 'Manage local Ollama models.',
+      keywords: ['ollama models'],
+      run: context.onOpenModelManager,
+    },
+    {
+      id: 'model.refresh',
+      title: 'Refresh models',
+      category: 'Model',
+      description: 'Reload Ollama readiness and installed models.',
+      disabledReason: getRefreshModelsDisabledReason(context),
+      keywords: ['ollama reload retry'],
+      run: context.onRefreshModels,
+    },
+  ]
+
+  if (context.ollamaModels.length === 0) {
+    commands.push({
+      id: 'model.switch.open',
+      title: 'Switch model',
+      category: 'Model',
+      description: 'Choose another installed local model.',
+      disabledReason: 'No local models are available.',
+      keywords: ['select change ollama'],
+      run: context.onOpenModelManager,
+    })
+  } else {
+    context.ollamaModels.forEach((model) => {
+      commands.push({
+        id: `model.switch:${model.name}`,
+        title: `Switch to ${model.name}`,
+        category: 'Model',
+        description: formatModelSize(model.size),
+        disabledReason:
+          context.selectedModel === model.name ? 'Already selected.' : undefined,
+        keywords: ['switch select model ollama'],
+        run: () => context.onSelectModel(model.name),
+      })
+    })
+  }
+
+  recommendedModels.forEach((model) => {
+    commands.push({
+      id: `model.download:${model.name}`,
+      title: `Download ${model.name}`,
+      category: 'Model',
+      description: model.note,
+      disabledReason: getDownloadModelDisabledReason(context, model.name),
+      keywords: ['install pull ollama'],
+      run: () => context.onDownloadModel(model.name),
+    })
+  })
+
+  commands.push(
+    {
+      id: 'settings.open',
+      title: 'Open settings',
+      category: 'App',
+      description: 'Configure Atlas.',
+      disabledReason: 'Settings have not been added yet.',
+      keywords: ['preferences'],
+      run: () => undefined,
+    },
+    {
+      id: 'chat.export_current',
+      title: 'Export current chat',
+      category: 'Chat',
+      description: 'Save the open conversation.',
+      disabledReason: 'Chat export lands in Chunk 4.',
+      keywords: ['download save'],
+      run: () => undefined,
+    },
+    {
+      id: 'diagnostics.open',
+      title: 'Open diagnostics',
+      category: 'App',
+      description: 'Review local app health.',
+      disabledReason: 'Diagnostics Center lands in Chunk 15.',
+      keywords: ['health status'],
+      run: () => undefined,
+    },
+    {
+      id: 'model_lab.open',
+      title: 'Open Model Lab',
+      category: 'Model',
+      description: 'Compare local model behavior.',
+      disabledReason: 'Model Lab lands in Chunk 9.',
+      keywords: ['benchmark evaluate'],
+      run: () => undefined,
+    },
+    {
+      id: 'knowledge.index_folder',
+      title: 'Index folder',
+      category: 'Knowledge',
+      description: 'Add local files to the knowledge workspace.',
+      disabledReason: 'Knowledge workspace lands in Chunk 12.',
+      keywords: ['rag documents files'],
+      run: () => undefined,
+    },
+  )
+
+  return commands
+}
+
+function normalizeCommandText(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+}
+
+function scoreCommand(command: AppCommand, query: string) {
+  const normalizedQuery = normalizeCommandText(query)
+  if (!normalizedQuery) {
+    return 1000
+  }
+
+  const target = normalizeCommandText(
+    [
+      command.title,
+      command.description,
+      command.category,
+      command.id,
+      ...(command.keywords ?? []),
+    ].join(' '),
+  )
+
+  if (target.includes(normalizedQuery)) {
+    return 900 - target.indexOf(normalizedQuery)
+  }
+
+  const tokens = normalizedQuery.split(/\s+/).filter(Boolean)
+  if (tokens.length > 1 && tokens.every((token) => target.includes(token))) {
+    return 700 - tokens.reduce((sum, token) => sum + target.indexOf(token), 0)
+  }
+
+  const compactQuery = normalizedQuery.replace(/\s+/g, '')
+  const compactTarget = target.replace(/\s+/g, '')
+  let queryIndex = 0
+  let score = 0
+
+  for (
+    let targetIndex = 0;
+    targetIndex < compactTarget.length && queryIndex < compactQuery.length;
+    targetIndex += 1
+  ) {
+    if (compactTarget[targetIndex] === compactQuery[queryIndex]) {
+      score += targetIndex === queryIndex ? 4 : 1
+      queryIndex += 1
+    }
+  }
+
+  return queryIndex === compactQuery.length ? score : null
+}
+
+function filterCommands(commands: AppCommand[], query: string) {
+  return commands
+    .map((command, index) => ({
+      command,
+      index,
+      score: scoreCommand(command, query),
+    }))
+    .filter(
+      (
+        entry,
+      ): entry is { command: AppCommand; index: number; score: number } =>
+        entry.score !== null,
+    )
+    .sort((first, second) => second.score - first.score || first.index - second.index)
+    .map((entry) => entry.command)
+}
+
 function ShipWheelLogo({ className = 'h-7 w-7' }: IconProps) {
   return (
     <svg
@@ -418,7 +713,11 @@ function App() {
   const [chatSearchResults, setChatSearchResults] = useState<ChatSummary[]>([])
   const [isChatSearchLoading, setIsChatSearchLoading] = useState(false)
   const [chatSearchError, setChatSearchError] = useState<string | null>(null)
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false)
+  const [commandQuery, setCommandQuery] = useState('')
+  const [activeCommandIndex, setActiveCommandIndex] = useState(0)
   const activeChatIdRef = useRef<string | null>(null)
+  const commandInputRef = useRef<HTMLInputElement | null>(null)
 
   useEffect(() => {
     activeChatIdRef.current = activeChatId
@@ -519,6 +818,48 @@ function App() {
       ignore = true
     }
   }, [activeChatId])
+
+  useEffect(() => {
+    function handleKeyDown(event: globalThis.KeyboardEvent) {
+      const isCommandShortcut =
+        (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k'
+
+      if (isCommandShortcut) {
+        event.preventDefault()
+        setCommandQuery('')
+        setActiveCommandIndex(0)
+        setIsCommandPaletteOpen((isOpen) => !isOpen)
+        return
+      }
+
+      if (event.key === 'Escape' && isCommandPaletteOpen) {
+        event.preventDefault()
+        setCommandQuery('')
+        setActiveCommandIndex(0)
+        setIsCommandPaletteOpen(false)
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [isCommandPaletteOpen])
+
+  useEffect(() => {
+    if (!isCommandPaletteOpen) {
+      return
+    }
+
+    const animationFrame = window.requestAnimationFrame(() => {
+      commandInputRef.current?.focus()
+    })
+
+    return () => {
+      window.cancelAnimationFrame(animationFrame)
+    }
+  }, [isCommandPaletteOpen])
 
   useEffect(() => {
     const query = chatSearchQuery.trim()
@@ -660,13 +1001,19 @@ function App() {
     setIsChatSearchLoading(false)
   }
 
+  function openChatSearch() {
+    setIsSidebarOpen(true)
+    setIsChatSearchOpen(true)
+    setChatSearchError(null)
+  }
+
   function handleToggleChatSearch() {
     if (isChatSearchOpen) {
       closeChatSearch()
       return
     }
 
-    setIsChatSearchOpen(true)
+    openChatSearch()
   }
 
   function handleChatSearchChange(value: string) {
@@ -689,6 +1036,10 @@ function App() {
     setMessages([])
     setDraft('')
     closeChatSearch()
+  }
+
+  function openModelManager() {
+    setIsModelPanelOpen(true)
   }
 
   async function handleSelectChat(chatId: string) {
@@ -869,9 +1220,86 @@ function App() {
     isOllamaStatusLoading ||
     !isTauriRuntime() ||
     ollamaStatus?.status === 'unavailable'
+  const commandEntries = buildCommandRegistry({
+    activeChatId,
+    deletingChatId,
+    isDesktop: isTauriRuntime(),
+    isOllamaStatusLoading,
+    modelAction,
+    ollamaModels,
+    ollamaStatus,
+    selectedModel,
+    onDeleteActiveChat: handleDeleteActiveChat,
+    onDownloadModel: handleDownloadModel,
+    onNewChat: handleNewChat,
+    onOpenChatSearch: openChatSearch,
+    onOpenModelManager: openModelManager,
+    onRefreshModels: refreshOllamaModels,
+    onSelectModel: handleSelectModel,
+  })
+  const visibleCommandEntries = filterCommands(commandEntries, commandQuery)
+  const activeVisibleCommandIndex =
+    visibleCommandEntries.length > 0
+      ? Math.min(activeCommandIndex, visibleCommandEntries.length - 1)
+      : -1
+
+  function closeCommandPalette() {
+    setIsCommandPaletteOpen(false)
+    setCommandQuery('')
+    setActiveCommandIndex(0)
+  }
+
+  function runCommand(command: AppCommand | undefined) {
+    if (!command || command.disabledReason) {
+      return
+    }
+
+    closeCommandPalette()
+    void Promise.resolve(command.run()).catch((error: unknown) => {
+      setHistoryError(String(error))
+    })
+  }
+
+  function handleCommandPaletteKeyDown(
+    event: KeyboardEvent<HTMLInputElement>,
+  ) {
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      if (visibleCommandEntries.length > 0) {
+        setActiveCommandIndex(
+          (currentIndex) => (currentIndex + 1) % visibleCommandEntries.length,
+        )
+      }
+      return
+    }
+
+    if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      if (visibleCommandEntries.length > 0) {
+        setActiveCommandIndex(
+          (currentIndex) =>
+            (currentIndex - 1 + visibleCommandEntries.length) %
+            visibleCommandEntries.length,
+        )
+      }
+      return
+    }
+
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      runCommand(visibleCommandEntries[activeVisibleCommandIndex])
+      return
+    }
+
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      closeCommandPalette()
+    }
+  }
 
   return (
-    <div className="flex min-h-svh w-full overflow-hidden bg-black text-zinc-50">
+    <>
+      <div className="flex min-h-svh w-full overflow-hidden bg-black text-zinc-50">
       <aside
         className={`min-h-svh flex-none overflow-hidden border-r border-zinc-800/80 px-4 py-4 transition-[width] duration-200 ${
           isSidebarOpen ? 'w-64' : 'w-18'
@@ -1309,7 +1737,116 @@ function App() {
           )}
         </form>
       </main>
-    </div>
+      </div>
+
+      {isCommandPaletteOpen ? (
+        <div
+          className="fixed inset-0 z-50 bg-black/70 px-4 py-[12vh]"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              closeCommandPalette()
+            }
+          }}
+        >
+          <section
+            className="mx-auto w-full max-w-2xl overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-950 shadow-[0_24px_80px_rgba(0,0,0,0.55)]"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Command palette"
+          >
+            <div className="flex min-h-14 items-center gap-3 border-b border-zinc-800 px-4">
+              <SearchIcon className="h-5 w-5 flex-none text-zinc-500" />
+              <label className="sr-only" htmlFor="command-palette-input">
+                Search commands
+              </label>
+              <input
+                ref={commandInputRef}
+                className="h-14 min-w-0 flex-1 border-0 bg-transparent text-base text-zinc-100 outline-none placeholder:text-zinc-600"
+                id="command-palette-input"
+                type="search"
+                value={commandQuery}
+                placeholder="Search commands"
+                role="combobox"
+                aria-controls="command-palette-results"
+                aria-expanded="true"
+                aria-activedescendant={
+                  activeVisibleCommandIndex >= 0
+                    ? `command-${visibleCommandEntries[activeVisibleCommandIndex].id}`
+                    : undefined
+                }
+                onChange={(event) => {
+                  setCommandQuery(event.target.value)
+                  setActiveCommandIndex(0)
+                }}
+                onKeyDown={handleCommandPaletteKeyDown}
+              />
+              <button
+                className="grid h-8 w-8 flex-none place-items-center rounded-lg border-0 bg-transparent text-zinc-500 transition-colors hover:bg-zinc-900 hover:text-zinc-100"
+                type="button"
+                aria-label="Close command palette"
+                onClick={closeCommandPalette}
+              >
+                <XIcon />
+              </button>
+            </div>
+
+            <div
+              className="max-h-[min(28rem,58vh)] overflow-y-auto p-2"
+              id="command-palette-results"
+              role="listbox"
+            >
+              {visibleCommandEntries.length > 0 ? (
+                visibleCommandEntries.map((command, index) => {
+                  const isActive = index === activeVisibleCommandIndex
+                  const isDisabled = command.disabledReason !== undefined
+
+                  return (
+                    <button
+                      className={`flex min-h-16 w-full min-w-0 items-center justify-between gap-4 rounded-xl border-0 px-3 py-2 text-left transition-colors ${
+                        isActive
+                          ? 'bg-zinc-800/90'
+                          : 'bg-transparent hover:bg-zinc-900'
+                      } ${isDisabled ? 'text-zinc-500' : 'text-zinc-100'}`}
+                      id={`command-${command.id}`}
+                      key={command.id}
+                      type="button"
+                      role="option"
+                      aria-selected={isActive}
+                      aria-disabled={isDisabled}
+                      onMouseEnter={() => setActiveCommandIndex(index)}
+                      onClick={() => runCommand(command)}
+                    >
+                      <span className="min-w-0">
+                        <span className="block truncate text-sm font-medium">
+                          {command.title}
+                        </span>
+                        {command.description ? (
+                          <span className="mt-0.5 block truncate text-xs text-zinc-500">
+                            {command.description}
+                          </span>
+                        ) : null}
+                        {command.disabledReason ? (
+                          <span className="mt-1 block text-xs text-amber-300/80">
+                            {command.disabledReason}
+                          </span>
+                        ) : null}
+                      </span>
+                      <span className="flex-none rounded-lg border border-zinc-800 px-2 py-1 text-[11px] font-medium text-zinc-500">
+                        {command.category}
+                      </span>
+                    </button>
+                  )
+                })
+              ) : (
+                <p className="px-3 py-8 text-center text-sm text-zinc-500">
+                  No commands found.
+                </p>
+              )}
+            </div>
+          </section>
+        </div>
+      ) : null}
+    </>
   )
 }
 
