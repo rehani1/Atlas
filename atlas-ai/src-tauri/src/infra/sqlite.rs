@@ -3,16 +3,17 @@ use std::{fs, path::Path, time::Duration};
 
 use crate::{
     domain::database::{DatabaseDiagnostics, DatabaseTableCount},
-    infra::{jobs, search},
+    infra::{benchmarks, jobs, search},
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 pub(crate) fn setup_database(conn: &Connection) -> Result<(), rusqlite::Error> {
     configure_connection(conn)?;
     create_current_schema(conn)?;
     jobs::create_schema(conn)?;
     search::create_schema(conn)?;
+    benchmarks::create_schema(conn)?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
 
     Ok(())
@@ -99,6 +100,7 @@ pub(crate) fn diagnostics(
         "jobs",
         "chat_search",
         "message_search",
+        "model_benchmarks",
     ]
     .into_iter()
     .map(|table_name| table_count(conn, table_name))

@@ -14,8 +14,11 @@ import {
   exportChat,
   getDatabaseDiagnostics,
   getOllamaStatus,
+  listModelBenchmarks,
+  listModelUsage,
   listJobs,
   searchConversations,
+  startModelBenchmark,
   type ChatExport,
   type ChatExportFormat,
   type ChatMessage,
@@ -24,6 +27,8 @@ import {
   type GenerationRun,
   type Job,
   type JobEvent,
+  type ModelBenchmark,
+  type ModelUsage,
   type OllamaModel,
   type OllamaStatus,
 } from './shared/api/tauri'
@@ -74,6 +79,7 @@ type CommandRegistryContext = {
   activeChatId: string | null
   deletingChatId: string | null
   exportAction: ChatExportFormat | null
+  hasActiveModelBenchmarkJob: boolean
   hasActiveModelPullJob: boolean
   isDesktop: boolean
   isOllamaStatusLoading: boolean
@@ -87,6 +93,7 @@ type CommandRegistryContext = {
   onNewChat: () => Promise<void>
   onOpenChatSearch: () => void
   onOpenDiagnostics: () => void
+  onOpenModelLab: () => void
   onOpenModelManager: () => void
   onRefreshModels: () => Promise<void>
   onSelectModel: (model: string) => void
@@ -188,6 +195,46 @@ function searchResultSourceLabel(result: ChatSearchResult) {
   }
 
   return result.role ? `${result.role} message` : 'Message match'
+}
+
+function formatTimestamp(timestamp: number | null | undefined) {
+  if (timestamp === null || timestamp === undefined) {
+    return 'Never'
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(new Date(timestamp))
+}
+
+function formatBenchmarkStatus(status: ModelBenchmark['status']) {
+  switch (status) {
+    case 'queued':
+      return 'Queued'
+    case 'running':
+      return 'Running'
+    case 'completed':
+      return 'Completed'
+    case 'cancelled':
+      return 'Cancelled'
+    case 'failed':
+      return 'Failed'
+  }
+}
+
+function getEvalSpeed(count: number | null, durationMs: number | null) {
+  if (count === null || durationMs === null || count <= 0 || durationMs <= 0) {
+    return null
+  }
+
+  return count / (durationMs / 1000)
+}
+
+function formatSpeed(value: number | null | undefined) {
+  return value === null || value === undefined ? 'n/a' : `${value.toFixed(1)} tok/s`
 }
 
 function getTimeToFirstToken(run: GenerationRun) {
@@ -498,6 +545,10 @@ function formatJobProgress(job: Job) {
     return jobStatusLabel(job.status)
   }
 
+  if (job.job_type === 'model_benchmark') {
+    return `${job.progress_current} / ${job.progress_total} prompts`
+  }
+
   const currentMb = job.progress_current / 1024 / 1024
   const totalMb = job.progress_total / 1024 / 1024
   return `${currentMb.toFixed(1)} / ${totalMb.toFixed(1)} MB`
@@ -627,10 +678,12 @@ function buildCommandRegistry(context: CommandRegistryContext): AppCommand[] {
       id: 'model_lab.open',
       title: 'Open Model Lab',
       category: 'Model',
-      description: 'Compare local model behavior.',
-      disabledReason: 'Model Lab lands in Chunk 9.',
+      description: 'Benchmark installed local models.',
+      disabledReason: context.isDesktop
+        ? undefined
+        : 'Model Lab requires the Tauri desktop app.',
       keywords: ['benchmark evaluate'],
-      run: () => undefined,
+      run: context.onOpenModelLab,
     },
     {
       id: 'knowledge.index_folder',
@@ -869,6 +922,12 @@ function App() {
   const [selectedModel, setSelectedModel] = useState('')
   const [modelError, setModelError] = useState<UiError | null>(null)
   const [modelAction, setModelAction] = useState<string | null>(null)
+  const [modelBenchmarks, setModelBenchmarks] = useState<ModelBenchmark[]>([])
+  const [modelUsage, setModelUsage] = useState<ModelUsage[]>([])
+  const [isModelLabOpen, setIsModelLabOpen] = useState(false)
+  const [isModelLabLoading, setIsModelLabLoading] = useState(false)
+  const [modelLabAction, setModelLabAction] = useState<string | null>(null)
+  const [modelLabError, setModelLabError] = useState<string | null>(null)
   const [jobs, setJobs] = useState<Job[]>([])
   const [isModelPanelOpen, setIsModelPanelOpen] = useState(false)
   const [isResponding, setIsResponding] = useState(false)
@@ -997,6 +1056,12 @@ function App() {
     listen<JobEvent>('job_updated', (event) => {
       if (!ignore) {
         setJobs((currentJobs) => upsertJob(currentJobs, event.payload.job))
+        if (
+          event.payload.job.job_type === 'model_benchmark' &&
+          !isActiveJob(event.payload.job)
+        ) {
+          void refreshModelLabData(false)
+        }
       }
     })
       .then((listener) => {
@@ -1208,6 +1273,60 @@ function App() {
     } finally {
       setIsOllamaStatusLoading(false)
       setModelAction(null)
+    }
+  }
+
+  async function refreshModelLabData(showLoading = true) {
+    if (!isTauriRuntime()) {
+      setModelLabError('Model Lab requires the Tauri desktop app.')
+      return
+    }
+
+    try {
+      if (showLoading) {
+        setIsModelLabLoading(true)
+      }
+      const [benchmarks, usage] = await Promise.all([
+        listModelBenchmarks(100),
+        listModelUsage(),
+      ])
+      setModelBenchmarks(benchmarks)
+      setModelUsage(usage)
+      setModelLabError(null)
+    } catch (error) {
+      setModelLabError(String(error))
+    } finally {
+      if (showLoading) {
+        setIsModelLabLoading(false)
+      }
+    }
+  }
+
+  function openModelLab() {
+    setIsModelLabOpen(true)
+    void refreshModelLabData()
+  }
+
+  async function handleStartModelBenchmark(model: string) {
+    if (!isTauriRuntime()) {
+      setModelLabError('Model Lab requires the Tauri desktop app.')
+      return
+    }
+
+    try {
+      setModelLabAction(model)
+      const job = await startModelBenchmark(model)
+      setJobs((currentJobs) => upsertJob(currentJobs, job))
+      await refreshModelLabData(false)
+      setModelLabError(null)
+    } catch (error) {
+      const details = String(error)
+      if (details !== 'Job cancelled') {
+        setModelLabError(details)
+      }
+      await refreshModelLabData(false)
+    } finally {
+      setModelLabAction(null)
     }
   }
 
@@ -1569,6 +1688,32 @@ function App() {
   const activeModelPullJob = jobs.find(
     (job) => job.job_type === 'model_pull' && isActiveJob(job),
   )
+  const activeModelBenchmarkJob = jobs.find(
+    (job) => job.job_type === 'model_benchmark' && isActiveJob(job),
+  )
+  const activeModelBenchmarkProgress = activeModelBenchmarkJob
+    ? getJobProgressPercent(activeModelBenchmarkJob)
+    : null
+  const modelUsageByName = new Map(
+    modelUsage.map((usage) => [usage.model_name, usage]),
+  )
+  const completedBenchmarks = modelBenchmarks.filter(
+    (benchmark) =>
+      benchmark.status === 'completed' && benchmark.tokens_per_second !== null,
+  )
+  const fastestBenchmark = completedBenchmarks.reduce<ModelBenchmark | null>(
+    (fastest, benchmark) => {
+      if (!fastest) {
+        return benchmark
+      }
+
+      return (benchmark.tokens_per_second ?? 0) >
+        (fastest.tokens_per_second ?? 0)
+        ? benchmark
+        : fastest
+    },
+    null,
+  )
   const modelDownloadsDisabled =
     modelAction !== null ||
     activeModelPullJob !== undefined ||
@@ -1579,6 +1724,7 @@ function App() {
     activeChatId,
     deletingChatId,
     exportAction,
+    hasActiveModelBenchmarkJob: activeModelBenchmarkJob !== undefined,
     hasActiveModelPullJob: activeModelPullJob !== undefined,
     isDesktop: isTauriRuntime(),
     isOllamaStatusLoading,
@@ -1592,6 +1738,7 @@ function App() {
     onNewChat: handleNewChat,
     onOpenChatSearch: openChatSearch,
     onOpenDiagnostics: openDiagnostics,
+    onOpenModelLab: openModelLab,
     onOpenModelManager: openModelManager,
     onRefreshModels: refreshOllamaModels,
     onSelectModel: handleSelectModel,
@@ -1909,6 +2056,13 @@ function App() {
                     onClick={refreshOllamaModels}
                   >
                     {modelAction === 'refresh' ? 'Refreshing' : 'Refresh'}
+                  </button>
+                  <button
+                    className="h-8 rounded-lg border border-zinc-800 bg-zinc-950 px-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900"
+                    type="button"
+                    onClick={openModelLab}
+                  >
+                    Lab
                   </button>
                   <button
                     className="grid h-8 w-8 place-items-center rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-400 transition-colors hover:bg-zinc-900 hover:text-zinc-100"
@@ -2258,6 +2412,283 @@ function App() {
             )
           })}
         </section>
+      ) : null}
+
+      {isModelLabOpen ? (
+        <div
+          className="fixed inset-0 z-50 bg-black/70 px-4 py-[6vh]"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setIsModelLabOpen(false)
+            }
+          }}
+        >
+          <section
+            className="mx-auto flex max-h-[88vh] w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-950 shadow-[0_24px_80px_rgba(0,0,0,0.55)]"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Model Lab"
+          >
+            <header className="flex items-start justify-between gap-4 border-b border-zinc-800 px-4 py-3">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-zinc-100">Model Lab</p>
+                <p className="mt-0.5 text-xs text-zinc-500">
+                  Speed and latency benchmarks for installed local models
+                </p>
+              </div>
+              <div className="flex flex-none items-center gap-2">
+                <button
+                  className="h-8 rounded-lg border border-zinc-800 px-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+                  type="button"
+                  disabled={isModelLabLoading}
+                  onClick={() => void refreshModelLabData()}
+                >
+                  {isModelLabLoading ? 'Loading' : 'Refresh'}
+                </button>
+                <button
+                  className="grid h-8 w-8 place-items-center rounded-lg border-0 bg-transparent text-zinc-500 transition-colors hover:bg-zinc-900 hover:text-zinc-100"
+                  type="button"
+                  aria-label="Close Model Lab"
+                  onClick={() => setIsModelLabOpen(false)}
+                >
+                  <XIcon />
+                </button>
+              </div>
+            </header>
+
+            <div className="overflow-y-auto p-4">
+              {modelLabError ? (
+                <p className="mb-3 rounded-xl border border-red-900/60 bg-red-950/30 px-3 py-2 text-sm text-red-200">
+                  {modelLabError}
+                </p>
+              ) : null}
+
+              {activeModelBenchmarkJob ? (
+                <div className="mb-4 rounded-xl border border-zinc-800 bg-zinc-900/60 px-3 py-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium text-zinc-100">
+                        {activeModelBenchmarkJob.label}
+                      </p>
+                      <p className="mt-0.5 text-xs text-zinc-500">
+                        {formatJobProgress(activeModelBenchmarkJob)}
+                      </p>
+                    </div>
+                    <button
+                      className="rounded-lg border border-zinc-700 px-2.5 py-1 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+                      type="button"
+                      disabled={activeModelBenchmarkJob.status === 'cancelling'}
+                      onClick={() => handleCancelJob(activeModelBenchmarkJob.id)}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                  {activeModelBenchmarkProgress !== null ? (
+                    <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-zinc-950">
+                      <div
+                        className="h-full rounded-full bg-zinc-100 transition-[width]"
+                        style={{
+                          width: `${activeModelBenchmarkProgress}%`,
+                        }}
+                      />
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+
+              <div className="mb-4 rounded-xl bg-zinc-900/70 px-3 py-2">
+                <p className="text-xs text-zinc-500">Fastest measured model</p>
+                <p className="mt-1 text-sm text-zinc-100">
+                  {fastestBenchmark
+                    ? `${fastestBenchmark.model_name} - ${formatSpeed(
+                        fastestBenchmark.tokens_per_second,
+                      )}`
+                    : 'No completed benchmark yet'}
+                </p>
+              </div>
+
+              <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.25fr)]">
+                <section className="min-w-0">
+                  <p className="mb-2 text-xs font-semibold tracking-[0.08em] text-zinc-500 uppercase">
+                    Installed Models
+                  </p>
+                  <div className="grid gap-2">
+                    {ollamaModels.length > 0 ? (
+                      ollamaModels.map((model) => {
+                        const usage = modelUsageByName.get(model.name)
+                        const modelBenchmarkRows = modelBenchmarks.filter(
+                          (benchmark) => benchmark.model_name === model.name,
+                        )
+                        const modelCompletedRows = modelBenchmarkRows.filter(
+                          (benchmark) =>
+                            benchmark.status === 'completed' &&
+                            benchmark.tokens_per_second !== null,
+                        )
+                        const fastestModelRow = modelCompletedRows.reduce<
+                          ModelBenchmark | null
+                        >((fastest, benchmark) => {
+                          if (!fastest) {
+                            return benchmark
+                          }
+
+                          return (benchmark.tokens_per_second ?? 0) >
+                            (fastest.tokens_per_second ?? 0)
+                            ? benchmark
+                            : fastest
+                        }, null)
+                        const benchmarkDisabled =
+                          activeModelBenchmarkJob !== undefined ||
+                          modelLabAction !== null ||
+                          isOllamaStatusLoading ||
+                          ollamaStatus?.status === 'unavailable'
+
+                        return (
+                          <div
+                            className="rounded-xl bg-zinc-900/70 px-3 py-2"
+                            key={model.name}
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <p className="truncate text-sm font-medium text-zinc-100">
+                                  {model.name}
+                                </p>
+                                <p className="mt-0.5 text-xs text-zinc-500">
+                                  {formatModelSize(model.size)}
+                                </p>
+                              </div>
+                              {fastestBenchmark?.model_name === model.name ? (
+                                <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-[11px] font-semibold text-zinc-950">
+                                  Fastest measured
+                                </span>
+                              ) : null}
+                            </div>
+                            <dl className="mt-3 grid grid-cols-2 gap-2 text-xs">
+                              <div>
+                                <dt className="text-zinc-600">Last used</dt>
+                                <dd className="mt-0.5 truncate text-zinc-300">
+                                  {formatTimestamp(usage?.last_used_at)}
+                                </dd>
+                              </div>
+                              <div>
+                                <dt className="text-zinc-600">Runs</dt>
+                                <dd className="mt-0.5 text-zinc-300">
+                                  {usage?.generation_count ?? 0}
+                                </dd>
+                              </div>
+                              <div>
+                                <dt className="text-zinc-600">Best speed</dt>
+                                <dd className="mt-0.5 text-zinc-300">
+                                  {formatSpeed(fastestModelRow?.tokens_per_second)}
+                                </dd>
+                              </div>
+                              <div>
+                                <dt className="text-zinc-600">Benchmarks</dt>
+                                <dd className="mt-0.5 text-zinc-300">
+                                  {modelBenchmarkRows.length}
+                                </dd>
+                              </div>
+                            </dl>
+                            <button
+                              className="mt-3 h-8 w-full rounded-lg bg-zinc-100 px-2.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-white disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500"
+                              type="button"
+                              disabled={benchmarkDisabled}
+                              onClick={() => handleStartModelBenchmark(model.name)}
+                            >
+                              {modelLabAction === model.name
+                                ? 'Benchmarking'
+                                : 'Run benchmark'}
+                            </button>
+                          </div>
+                        )
+                      })
+                    ) : (
+                      <p className="rounded-xl bg-zinc-900/70 px-3 py-2 text-sm text-zinc-500">
+                        No installed models found.
+                      </p>
+                    )}
+                  </div>
+                </section>
+
+                <section className="min-w-0">
+                  <p className="mb-2 text-xs font-semibold tracking-[0.08em] text-zinc-500 uppercase">
+                    Benchmark History
+                  </p>
+                  {modelBenchmarks.length > 0 ? (
+                    <div className="grid gap-2">
+                      {modelBenchmarks.slice(0, 24).map((benchmark) => {
+                        const promptSpeed = getEvalSpeed(
+                          benchmark.prompt_eval_count,
+                          benchmark.prompt_eval_duration_ms,
+                        )
+
+                        return (
+                          <div
+                            className="rounded-xl bg-zinc-900/70 px-3 py-2"
+                            key={benchmark.id}
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <p className="truncate text-sm font-medium text-zinc-100">
+                                  {benchmark.model_name}
+                                </p>
+                                <p className="mt-0.5 text-xs text-zinc-500">
+                                  {benchmark.prompt_label} -{' '}
+                                  {formatBenchmarkStatus(benchmark.status)}
+                                </p>
+                              </div>
+                              <span className="flex-none text-xs text-zinc-500">
+                                {formatTimestamp(
+                                  benchmark.completed_at ?? benchmark.started_at,
+                                )}
+                              </span>
+                            </div>
+                            <dl className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+                              <div>
+                                <dt className="text-zinc-600">Total</dt>
+                                <dd className="mt-0.5 text-zinc-300">
+                                  {formatDurationMs(benchmark.total_duration_ms) ??
+                                    'n/a'}
+                                </dd>
+                              </div>
+                              <div>
+                                <dt className="text-zinc-600">First token</dt>
+                                <dd className="mt-0.5 text-zinc-300">
+                                  {formatDurationMs(benchmark.first_token_ms) ??
+                                    'n/a'}
+                                </dd>
+                              </div>
+                              <div>
+                                <dt className="text-zinc-600">Prompt</dt>
+                                <dd className="mt-0.5 text-zinc-300">
+                                  {formatSpeed(promptSpeed)}
+                                </dd>
+                              </div>
+                              <div>
+                                <dt className="text-zinc-600">Completion</dt>
+                                <dd className="mt-0.5 text-zinc-300">
+                                  {formatSpeed(benchmark.tokens_per_second)}
+                                </dd>
+                              </div>
+                            </dl>
+                            {benchmark.error_message ? (
+                              <p className="mt-2 break-words text-xs text-red-200/90">
+                                {benchmark.error_message}
+                              </p>
+                            ) : null}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  ) : (
+                    <p className="rounded-xl bg-zinc-900/70 px-3 py-2 text-sm text-zinc-500">
+                      No benchmark history yet.
+                    </p>
+                  )}
+                </section>
+              </div>
+            </div>
+          </section>
+        </div>
       ) : null}
 
       {isDiagnosticsOpen ? (

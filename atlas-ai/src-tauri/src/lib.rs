@@ -2,12 +2,15 @@ mod app;
 mod domain;
 mod infra;
 
-use app::{jobs as job_service, models as model_service};
+use app::{benchmarks as benchmark_service, jobs as job_service, models as model_service};
+use domain::benchmark::{ModelBenchmark, ModelUsage};
 use domain::database::DatabaseDiagnostics;
 use domain::job::{Job, JobEvent, JobStatus, JobType};
 use domain::model::{validate_ollama_model_name, OllamaModel, OllamaStatus};
 use domain::search::ChatSearchResult;
-use infra::{jobs as job_repository, ollama, search, sqlite};
+use infra::{
+    benchmarks::CompletedBenchmarkMetrics, jobs as job_repository, ollama, search, sqlite,
+};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -36,6 +39,11 @@ struct GenerationTasks {
 #[derive(Default)]
 struct JobTasks {
     tasks: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+#[derive(Default)]
+struct BenchmarkTasks {
+    active_job_id: Mutex<Option<String>>,
 }
 
 #[derive(Serialize)]
@@ -282,6 +290,234 @@ fn run_model_pull_job(
         }
     };
 
+    emit_job_event(&app, &final_job)?;
+    Ok(final_job)
+}
+
+fn update_model_benchmark_progress(
+    store: &ChatStore,
+    app: &AppHandle,
+    job_id: &str,
+    model: &str,
+    prompt_label: &str,
+    progress_current: i64,
+    progress_total: i64,
+) -> Result<(), String> {
+    let label = if progress_current >= progress_total {
+        format!("Benchmarked {model}")
+    } else {
+        format!("Benchmarking {model}: {prompt_label}")
+    };
+    let job = {
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        job_service::update_progress(
+            &conn,
+            job_id,
+            Some(progress_current),
+            Some(progress_total),
+            Some(&label),
+        )?
+    };
+
+    emit_job_event(app, &job)
+}
+
+fn finish_model_benchmark_cancelled(
+    store: &ChatStore,
+    job_id: &str,
+    completed_at: i64,
+) -> Result<Job, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    benchmark_service::mark_remaining_cancelled(&conn, job_id, completed_at)?;
+    job_service::finish_cancelled(&conn, job_id, completed_at)
+}
+
+fn finish_model_benchmark_failed(
+    store: &ChatStore,
+    job_id: &str,
+    completed_at: i64,
+    error_message: &str,
+) -> Result<Job, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    benchmark_service::mark_remaining_failed(&conn, job_id, completed_at, error_message)?;
+    job_service::finish_failed(&conn, job_id, error_message, completed_at)
+}
+
+fn benchmark_metrics(
+    started_at: i64,
+    completed_at: i64,
+    first_token_at: Option<i64>,
+    metadata: &GenerationMetadata,
+) -> CompletedBenchmarkMetrics {
+    CompletedBenchmarkMetrics {
+        total_duration_ms: metadata
+            .total_duration_ms
+            .or_else(|| Some(completed_at.saturating_sub(started_at))),
+        first_token_ms: first_token_at
+            .map(|first_token_at| first_token_at.saturating_sub(started_at)),
+        prompt_eval_count: metadata.prompt_eval_count,
+        prompt_eval_duration_ms: metadata.prompt_eval_duration_ms,
+        eval_count: metadata.eval_count,
+        eval_duration_ms: metadata.eval_duration_ms,
+        tokens_per_second: metadata.tokens_per_second,
+    }
+}
+
+fn run_model_benchmark_job(
+    store: ChatStore,
+    app: AppHandle,
+    job_id: String,
+    model: String,
+    benchmarks: Vec<ModelBenchmark>,
+    cancellation: Arc<AtomicBool>,
+) -> Result<Job, String> {
+    let running_job = {
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        job_service::start(&conn, &job_id, now_millis()?)?
+    };
+    emit_job_event(&app, &running_job)?;
+
+    let installed_models = model_service::list_models()?;
+    if !installed_models
+        .iter()
+        .any(|installed| installed.name == model)
+    {
+        let completed_at = now_millis()?;
+        let final_job = finish_model_benchmark_failed(
+            &store,
+            &job_id,
+            completed_at,
+            "Model is not installed. Install it before benchmarking.",
+        )?;
+        emit_job_event(&app, &final_job)?;
+        return Ok(final_job);
+    }
+
+    let progress_total = benchmarks.len() as i64;
+    for (index, prompt) in benchmark_service::BENCHMARK_SUITE.iter().enumerate() {
+        let benchmark = benchmarks
+            .iter()
+            .find(|benchmark| benchmark.prompt_type == prompt.prompt_type)
+            .ok_or_else(|| format!("Benchmark row was not found for {}", prompt.prompt_type))?;
+
+        if cancellation.load(Ordering::SeqCst) {
+            let completed_at = now_millis()?;
+            let final_job = finish_model_benchmark_cancelled(&store, &job_id, completed_at)?;
+            emit_job_event(&app, &final_job)?;
+            return Ok(final_job);
+        }
+
+        update_model_benchmark_progress(
+            &store,
+            &app,
+            &job_id,
+            &model,
+            prompt.prompt_label,
+            index as i64,
+            progress_total,
+        )?;
+
+        let started_at = now_millis()?;
+        {
+            let conn = store
+                .conn
+                .lock()
+                .map_err(|_| "Database lock was poisoned".to_string())?;
+            benchmark_service::mark_running(&conn, &benchmark.id, started_at)?;
+        }
+
+        let stream_result = stream_ollama_chat(
+            model.clone(),
+            vec![OllamaChatMessage {
+                role: "user".to_string(),
+                content: prompt.prompt_text.to_string(),
+            }],
+            cancellation.clone(),
+        );
+        let completed_at = now_millis()?;
+
+        match stream_result {
+            Ok(result) => {
+                let metrics = benchmark_metrics(
+                    started_at,
+                    completed_at,
+                    result.first_token_at,
+                    &result.metadata,
+                );
+                let conn = store
+                    .conn
+                    .lock()
+                    .map_err(|_| "Database lock was poisoned".to_string())?;
+                benchmark_service::mark_completed(&conn, &benchmark.id, completed_at, &metrics)?;
+            }
+            Err(error) if error.cancelled || cancellation.load(Ordering::SeqCst) => {
+                {
+                    let conn = store
+                        .conn
+                        .lock()
+                        .map_err(|_| "Database lock was poisoned".to_string())?;
+                    benchmark_service::mark_cancelled(&conn, &benchmark.id, completed_at)?;
+                }
+                let final_job = finish_model_benchmark_cancelled(&store, &job_id, completed_at)?;
+                emit_job_event(&app, &final_job)?;
+                return Ok(final_job);
+            }
+            Err(error) => {
+                {
+                    let conn = store
+                        .conn
+                        .lock()
+                        .map_err(|_| "Database lock was poisoned".to_string())?;
+                    benchmark_service::mark_failed(
+                        &conn,
+                        &benchmark.id,
+                        completed_at,
+                        &error.message,
+                    )?;
+                }
+                let final_job =
+                    finish_model_benchmark_failed(&store, &job_id, completed_at, &error.message)?;
+                emit_job_event(&app, &final_job)?;
+                return Ok(final_job);
+            }
+        }
+
+        update_model_benchmark_progress(
+            &store,
+            &app,
+            &job_id,
+            &model,
+            prompt.prompt_label,
+            (index + 1) as i64,
+            progress_total,
+        )?;
+    }
+
+    let completed_at = now_millis()?;
+    let result_json = serde_json::json!({
+      "model": model,
+      "benchmark_count": benchmarks.len()
+    })
+    .to_string();
+    let final_job = {
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        job_service::finish_succeeded(&conn, &job_id, Some(&result_json), completed_at)?
+    };
     emit_job_event(&app, &final_job)?;
     Ok(final_job)
 }
@@ -1296,6 +1532,53 @@ fn get_database_diagnostics(store: State<'_, ChatStore>) -> Result<DatabaseDiagn
 }
 
 #[tauri::command]
+fn list_model_benchmarks(
+    store: State<'_, ChatStore>,
+    limit: Option<i64>,
+) -> Result<Vec<ModelBenchmark>, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    benchmark_service::list_recent(&conn, limit.unwrap_or(50))
+}
+
+#[tauri::command]
+fn list_model_usage(store: State<'_, ChatStore>) -> Result<Vec<ModelUsage>, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    let mut statement = conn
+        .prepare(
+            "
+      SELECT
+        model_name,
+        MAX(started_at) AS last_used_at,
+        COUNT(*) AS generation_count
+      FROM generation_runs
+      GROUP BY model_name
+      ORDER BY last_used_at DESC
+      ",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let usage = statement
+        .query_map([], |row| {
+            Ok(ModelUsage {
+                model_name: row.get(0)?,
+                last_used_at: row.get(1)?,
+                generation_count: row.get(2)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+
+    Ok(usage)
+}
+
+#[tauri::command]
 fn cancel_job(
     app: AppHandle,
     store: State<'_, ChatStore>,
@@ -1331,6 +1614,124 @@ fn cancel_job(
 
     emit_job_event(&app, &job)?;
     Ok(job)
+}
+
+#[tauri::command]
+async fn start_model_benchmark(
+    app: AppHandle,
+    store: State<'_, ChatStore>,
+    tasks: State<'_, JobTasks>,
+    benchmark_tasks: State<'_, BenchmarkTasks>,
+    model: String,
+) -> Result<Job, String> {
+    let model = validate_ollama_model_name(&model)?;
+    let payload_json = serde_json::json!({
+      "model": &model,
+      "suite": benchmark_service::BENCHMARK_SUITE
+        .iter()
+        .map(|prompt| prompt.prompt_type)
+        .collect::<Vec<_>>()
+    })
+    .to_string();
+    let now = now_millis()?;
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let (job, benchmarks) = {
+        let mut active_job_id = benchmark_tasks
+            .active_job_id
+            .lock()
+            .map_err(|_| "Benchmark task lock was poisoned".to_string())?;
+
+        if active_job_id.is_some() {
+            return Err("A model benchmark is already running.".to_string());
+        }
+
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        let job = job_service::create(
+            &conn,
+            JobType::ModelBenchmark,
+            &format!("Queued benchmark for {model}"),
+            Some(&payload_json),
+            now,
+        )?;
+        let benchmarks = benchmark_service::create_suite(&conn, &job.id, &model, now)?;
+        tasks
+            .tasks
+            .lock()
+            .map_err(|_| "Job task lock was poisoned".to_string())?
+            .insert(job.id.clone(), cancellation.clone());
+        *active_job_id = Some(job.id.clone());
+        (job, benchmarks)
+    };
+
+    if let Err(error) = emit_job_event(&app, &job) {
+        tasks
+            .tasks
+            .lock()
+            .map_err(|_| "Job task lock was poisoned".to_string())?
+            .remove(&job.id);
+        let mut active_job_id = benchmark_tasks
+            .active_job_id
+            .lock()
+            .map_err(|_| "Benchmark task lock was poisoned".to_string())?;
+        if active_job_id.as_deref() == Some(job.id.as_str()) {
+            *active_job_id = None;
+        }
+        return Err(error);
+    }
+
+    let store_for_job = store.inner().clone();
+    let app_for_job = app.clone();
+    let job_id = job.id.clone();
+    let job_id_for_cleanup = job.id.clone();
+    let cancellation_for_job = cancellation.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        run_model_benchmark_job(
+            store_for_job,
+            app_for_job,
+            job_id,
+            model,
+            benchmarks,
+            cancellation_for_job,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string());
+
+    {
+        let mut tasks = tasks
+            .tasks
+            .lock()
+            .map_err(|_| "Job task lock was poisoned".to_string())?;
+        if tasks
+            .get(&job_id_for_cleanup)
+            .is_some_and(|current_task| Arc::ptr_eq(current_task, &cancellation))
+        {
+            tasks.remove(&job_id_for_cleanup);
+        }
+    }
+    {
+        let mut active_job_id = benchmark_tasks
+            .active_job_id
+            .lock()
+            .map_err(|_| "Benchmark task lock was poisoned".to_string())?;
+        if active_job_id.as_deref() == Some(job_id_for_cleanup.as_str()) {
+            *active_job_id = None;
+        }
+    }
+
+    let final_job = result??;
+    match final_job.status {
+        JobStatus::Succeeded => Ok(final_job),
+        JobStatus::Cancelled => Err("Job cancelled".to_string()),
+        JobStatus::Failed => Err(final_job
+            .error_message
+            .clone()
+            .unwrap_or_else(|| "Job failed".to_string())),
+        _ => Ok(final_job),
+    }
 }
 
 #[tauri::command]
@@ -1615,6 +2016,7 @@ pub fn run() {
             app.manage(ChatStore::new(app_data_dir.join("atlas.sqlite3"))?);
             app.manage(GenerationTasks::default());
             app.manage(JobTasks::default());
+            app.manage(BenchmarkTasks::default());
 
             Ok(())
         })
@@ -1631,7 +2033,10 @@ pub fn run() {
             list_ollama_models,
             list_jobs,
             get_database_diagnostics,
+            list_model_benchmarks,
+            list_model_usage,
             cancel_job,
+            start_model_benchmark,
             download_ollama_model,
             delete_ollama_model,
             generate_assistant_response,
@@ -1649,13 +2054,17 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::app::jobs as job_service;
+    use super::app::{benchmarks as benchmark_service, jobs as job_service};
+    use super::domain::benchmark::ModelBenchmarkStatus;
     use super::domain::job::{JobStatus, JobType};
     use super::domain::model::{
         build_ollama_status, validate_ollama_model_name, OllamaModel, OllamaStatusKind,
     };
     use super::domain::search::SearchResultSource;
-    use super::infra::{jobs as job_repository, search, sqlite};
+    use super::infra::{
+        benchmarks::{self as benchmark_repository, CompletedBenchmarkMetrics},
+        jobs as job_repository, search, sqlite,
+    };
     use super::{
         calculate_tokens_per_second, escape_like_pattern, format_timestamp_ms, nanos_to_millis,
         normalize_title, render_chat_export, sanitize_file_name, ChatExportFormat, ChatMessage,
@@ -1874,6 +2283,56 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_service_persists_suite_metrics() {
+        let conn = Connection::open_in_memory().unwrap();
+        job_repository::create_schema(&conn).unwrap();
+        benchmark_repository::create_schema(&conn).unwrap();
+
+        let job = job_service::create(
+            &conn,
+            JobType::ModelBenchmark,
+            "Queued benchmark",
+            Some(r#"{"model":"llama3.2:3b"}"#),
+            100,
+        )
+        .unwrap();
+        let benchmarks =
+            benchmark_service::create_suite(&conn, &job.id, "llama3.2:3b", 100).unwrap();
+
+        assert_eq!(benchmarks.len(), benchmark_service::BENCHMARK_SUITE.len());
+        assert!(benchmarks
+            .iter()
+            .all(|benchmark| benchmark.status == ModelBenchmarkStatus::Queued));
+
+        let running = benchmark_service::mark_running(&conn, &benchmarks[0].id, 125).unwrap();
+        assert_eq!(running.status, ModelBenchmarkStatus::Running);
+        assert_eq!(running.started_at, Some(125));
+
+        let metrics = CompletedBenchmarkMetrics {
+            total_duration_ms: Some(500),
+            first_token_ms: Some(120),
+            prompt_eval_count: Some(40),
+            prompt_eval_duration_ms: Some(80),
+            eval_count: Some(100),
+            eval_duration_ms: Some(250),
+            tokens_per_second: Some(400.0),
+        };
+        let completed =
+            benchmark_service::mark_completed(&conn, &benchmarks[0].id, 700, &metrics).unwrap();
+
+        assert_eq!(completed.status, ModelBenchmarkStatus::Completed);
+        assert_eq!(completed.total_duration_ms, Some(500));
+        assert_eq!(completed.first_token_ms, Some(120));
+        assert_eq!(completed.tokens_per_second, Some(400.0));
+
+        let recent = benchmark_service::list_recent(&conn, 10).unwrap();
+        assert_eq!(recent.len(), benchmark_service::BENCHMARK_SUITE.len());
+        assert!(recent.iter().any(|benchmark| {
+            benchmark.id == completed.id && benchmark.status == ModelBenchmarkStatus::Completed
+        }));
+    }
+
+    #[test]
     fn sqlite_setup_enables_wal_and_reports_safe_diagnostics() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1885,7 +2344,7 @@ mod tests {
         sqlite::setup_database(&conn).unwrap();
         let diagnostics = sqlite::diagnostics(&conn, &db_path).unwrap();
 
-        assert_eq!(diagnostics.user_version, 2);
+        assert_eq!(diagnostics.user_version, 3);
         assert_eq!(diagnostics.journal_mode, "wal");
         assert_eq!(diagnostics.integrity_check, "ok");
         assert!(diagnostics
@@ -1896,6 +2355,10 @@ mod tests {
             .table_counts
             .iter()
             .any(|table| table.table_name == "message_search" && table.row_count == 0));
+        assert!(diagnostics
+            .table_counts
+            .iter()
+            .any(|table| table.table_name == "model_benchmarks" && table.row_count == 0));
 
         drop(conn);
         let _ = fs::remove_file(&db_path);

@@ -131,6 +131,40 @@ export type ChatSearchResult = {
   snippet: SearchSnippetPart[]
 }
 
+export type ModelBenchmarkStatus =
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'cancelled'
+  | 'failed'
+
+export type ModelBenchmark = {
+  id: string
+  job_id: string
+  model_name: string
+  prompt_type: string
+  prompt_label: string
+  prompt_text_hash: string
+  started_at: number | null
+  completed_at: number | null
+  status: ModelBenchmarkStatus
+  total_duration_ms: number | null
+  first_token_ms: number | null
+  prompt_eval_count: number | null
+  prompt_eval_duration_ms: number | null
+  eval_count: number | null
+  eval_duration_ms: number | null
+  tokens_per_second: number | null
+  error_message: string | null
+  created_at: number
+}
+
+export type ModelUsage = {
+  model_name: string
+  last_used_at: number | null
+  generation_count: number
+}
+
 const commands = {
   getOllamaStatus: 'get_ollama_status',
   downloadOllamaModel: 'download_ollama_model',
@@ -140,6 +174,9 @@ const commands = {
   cancelJob: 'cancel_job',
   getDatabaseDiagnostics: 'get_database_diagnostics',
   searchConversations: 'search_conversations',
+  listModelBenchmarks: 'list_model_benchmarks',
+  listModelUsage: 'list_model_usage',
+  startModelBenchmark: 'start_model_benchmark',
 } as const
 
 export function getOllamaStatus(selectedModel?: string) {
@@ -177,4 +214,16 @@ export function searchConversations(query: string, limit = 30) {
     query,
     limit,
   })
+}
+
+export function listModelBenchmarks(limit = 100) {
+  return invoke<ModelBenchmark[]>(commands.listModelBenchmarks, { limit })
+}
+
+export function listModelUsage() {
+  return invoke<ModelUsage[]>(commands.listModelUsage)
+}
+
+export function startModelBenchmark(model: string) {
+  return invoke<Job>(commands.startModelBenchmark, { model })
 }

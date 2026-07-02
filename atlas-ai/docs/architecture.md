@@ -14,20 +14,22 @@ Tailwind CSS, SQLite, and Ollama. The current codebase is intentionally compact:
 - Most backend state, SQLite repositories, command handlers, streaming, and
   cancellation still live in `src-tauri/src/lib.rs`.
 - Backend service slices now include model management, jobs, database
-  setup/diagnostics, and FTS search:
+  setup/diagnostics, FTS search, and model benchmarks:
   `src-tauri/src/domain/model.rs`, `src-tauri/src/app/models.rs`,
   `src-tauri/src/domain/job.rs`, `src-tauri/src/app/jobs.rs`,
+  `src-tauri/src/domain/benchmark.rs`, `src-tauri/src/app/benchmarks.rs`,
   `src-tauri/src/infra/jobs.rs`, `src-tauri/src/domain/database.rs`,
   `src-tauri/src/domain/search.rs`, `src-tauri/src/infra/search.rs`,
-  `src-tauri/src/infra/sqlite.rs`, and `src-tauri/src/infra/ollama.rs`.
+  `src-tauri/src/infra/benchmarks.rs`, `src-tauri/src/infra/sqlite.rs`, and
+  `src-tauri/src/infra/ollama.rs`.
 - `src-tauri/src/main.rs` only starts `atlas_lib::run()`.
 - Public release docs are `README.md` and `CHANGELOG.md`.
 
 There is a minimal typed frontend API wrapper for touched Ollama status, model
 lifecycle, export, jobs, database diagnostics, and rich search commands in
 `src/shared/api/tauri.ts`. There are no frontend feature folders, Rust
-`commands` module, database migrations directory, document indexing, memory,
-import, or model benchmark surfaces yet.
+`commands` module, database migrations directory, document indexing, memory, or
+import surfaces yet.
 
 `src/App.tsx` now also owns a small frontend-only command registry and
 `Cmd/Ctrl+K` command palette. The registry uses stable command IDs and routes
@@ -60,7 +62,8 @@ Current Tauri permissions are limited to `core:default` in
 
 Rust owns privileged operations:
 
-- SQLite connection, schema setup, diagnostics, FTS search, and queries.
+- SQLite connection, schema setup, diagnostics, FTS search, benchmark storage,
+  and queries.
 - Chat and message persistence.
 - Ollama readiness, model list, pull, delete, and chat requests.
 - Model name validation.
@@ -101,7 +104,10 @@ download_ollama_model(model: String) -> Job
 delete_ollama_model(model: String) -> Vec<OllamaModel>
 list_jobs(limit: Option<i64>) -> Vec<Job>
 get_database_diagnostics() -> DatabaseDiagnostics
+list_model_benchmarks(limit: Option<i64>) -> Vec<ModelBenchmark>
+list_model_usage() -> Vec<ModelUsage>
 cancel_job(job_id: String) -> Job
+start_model_benchmark(model: String) -> Job
 generate_assistant_response(chat_id: String, model: String) -> ChatMessage
 cancel_ollama_generation(chat_id: String) -> bool
 ```
@@ -215,6 +221,31 @@ ChatSearchResult
 - source: "title" | "message"
 - score: number
 - snippet: SearchSnippetPart[]
+
+ModelBenchmark
+- id: string
+- job_id: string
+- model_name: string
+- prompt_type: string
+- prompt_label: string
+- prompt_text_hash: string
+- started_at: number | null
+- completed_at: number | null
+- status: "queued" | "running" | "completed" | "cancelled" | "failed"
+- total_duration_ms: number | null
+- first_token_ms: number | null
+- prompt_eval_count: number | null
+- prompt_eval_duration_ms: number | null
+- eval_count: number | null
+- eval_duration_ms: number | null
+- tokens_per_second: number | null
+- error_message: string | null
+- created_at: number
+
+ModelUsage
+- model_name: string
+- last_used_at: number | null
+- generation_count: number
 ```
 
 The backend emits `job_updated` events for job creation, start, progress,
@@ -234,7 +265,8 @@ database and calls `infra::sqlite::setup_database(&conn)`, which configures the
 connection and runs repeatable baseline schema setup. The current
 `chats`/`messages`/`generation_runs`/`jobs` schema is treated as baseline
 version 1. Chunk 8 adds FTS search tables and records the current schema as
-`PRAGMA user_version = 2`.
+version 2. Chunk 9 adds `model_benchmarks` and records the current schema as
+`PRAGMA user_version = 3`.
 
 There is no migrations directory yet. Future schema changes should add
 idempotent versions after the v1 baseline instead of editing historical setup in
@@ -336,6 +368,33 @@ USING fts5(
   created_at UNINDEXED,
   tokenize = 'unicode61'
 );
+
+CREATE TABLE IF NOT EXISTS model_benchmarks (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  model_name TEXT NOT NULL,
+  prompt_type TEXT NOT NULL,
+  prompt_label TEXT NOT NULL,
+  prompt_text_hash TEXT NOT NULL,
+  started_at INTEGER,
+  completed_at INTEGER,
+  status TEXT NOT NULL CHECK(status IN (
+    'queued',
+    'running',
+    'completed',
+    'cancelled',
+    'failed'
+  )),
+  total_duration_ms INTEGER,
+  first_token_ms INTEGER,
+  prompt_eval_count INTEGER,
+  prompt_eval_duration_ms INTEGER,
+  eval_count INTEGER,
+  eval_duration_ms INTEGER,
+  tokens_per_second REAL,
+  error_message TEXT,
+  created_at INTEGER NOT NULL
+);
 ```
 
 Current indexes and triggers:
@@ -359,6 +418,15 @@ CREATE INDEX IF NOT EXISTS idx_jobs_created_at
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status_created_at
   ON jobs(status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_model_benchmarks_model_completed
+  ON model_benchmarks(model_name, completed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_model_benchmarks_job
+  ON model_benchmarks(job_id);
+
+CREATE INDEX IF NOT EXISTS idx_model_benchmarks_created
+  ON model_benchmarks(created_at DESC);
 
 CREATE TRIGGER IF NOT EXISTS messages_after_insert_update_chat
 AFTER INSERT ON messages
@@ -396,6 +464,10 @@ Persistence behavior:
 - `jobs` rows persist long-running work. Chunk 6 uses them for model pulls with
   status, progress bytes when Ollama provides totals, payload/result JSON, and
   readable failure messages.
+- `model_benchmarks` rows persist one fixed-suite prompt result per benchmark
+  job, including prompt hash, status, total duration, first-token latency,
+  prompt/eval token counts, durations, completion tokens/sec, and readable
+  failure/cancellation messages.
 - During startup, queued/running/cancelling jobs from a previous process are
   marked `failed` with an interruption message so stale jobs do not remain
   cancellable forever.
@@ -405,8 +477,8 @@ Persistence behavior:
 - WAL mode is enabled for the file-backed desktop database.
 - `get_database_diagnostics` reads the database path, database/WAL/SHM sizes,
   journal mode, schema user version, page counts, free pages, integrity check,
-  and table counts for core tables and FTS tables. It does not export chat
-  content or mutate user data.
+  and table counts for core tables, FTS tables, and benchmark tables. It does
+  not export chat content or mutate user data.
 
 ## Chat Generation Flow
 
@@ -498,6 +570,16 @@ Current model operations:
 - `cancel_job(job_id)` marks non-terminal jobs `cancelling` and flips the
   matching in-memory cancellation token when the job is active in this process.
 - `list_jobs(limit)` returns recent jobs for the frontend status surface.
+- `start_model_benchmark(model)` validates the model name, creates a
+  `model_benchmark` job, creates queued `model_benchmarks` rows for the fixed
+  five-prompt suite, verifies the model is already installed, then runs the
+  prompts one at a time through local Ollama streaming.
+- Only one benchmark job is allowed at a time in this process. Benchmark jobs
+  use the same `cancel_job` path and store cancelled/failed rows when stopped.
+- `list_model_benchmarks(limit)` returns persisted benchmark rows for Model Lab
+  history.
+- `list_model_usage()` groups `generation_runs` by model to show last chat usage
+  and generation counts.
 
 Model names reject empty strings, whitespace, double quotes, and backslashes.
 An empty Ollama model list is represented as `running_without_models`, not a
@@ -507,8 +589,12 @@ Current limitations:
 
 - Model pull still awaits command completion, but progress is visible through
   job events while the command runs.
+- Model benchmark still awaits command completion, but progress is visible
+  through job events while the command runs.
 - Model pull cancellation is checked between blocking stream reads, so a stalled
   read may delay cancellation.
+- Model benchmark cancellation is checked between blocking stream reads, so a
+  stalled benchmark response may delay cancellation.
 - Model delete still has command-level orchestration in `lib.rs` and no job
   record.
 - Chat generation still uses `GenerationTasks` keyed by `chat_id`; it has not
@@ -561,6 +647,8 @@ Current limitations:
 - Ollama readiness status and readiness loading state.
 - Ollama models and selected model.
 - Model panel visibility and model action state.
+- Model Lab visibility, benchmark history, model usage rows, loading/action
+  state, and error state.
 - Recent job records from `list_jobs` and `job_updated` events.
 - Database diagnostics modal, loading state, and error state.
 - Export menu visibility and active export format.
@@ -578,6 +666,7 @@ Existing stale-state guards:
 - Chat search debounces for 180 ms and uses an `ignore` flag.
 - Job event handling upserts jobs by `job_id`, so stale events cannot overwrite
   unrelated jobs.
+- Model benchmark terminal job events refresh Model Lab history and usage.
 - `activeChatIdRef` guards against appending/reloading assistant messages into a
   chat that is no longer active.
 - Search result jumps are scoped by `chat_id` and `message_id`, so selecting a
@@ -592,10 +681,16 @@ The command palette opens with `Cmd/Ctrl+K`, focuses its search field, supports
 arrow/enter keyboard selection, and closes on escape or backdrop click. Initial
 enabled commands call existing handlers for new chat, chat search, model manager
 open, model refresh, model selection, recommended model downloads, database
-diagnostics, and active chat deletion when valid. It also exposes active-chat
-export commands for Markdown, JSON, and plain text. Future surfaces such as
-settings, Model Lab, and folder indexing are represented as disabled commands
-with visible reasons instead of placeholder business logic.
+diagnostics, Model Lab, and active chat deletion when valid. It also exposes
+active-chat export commands for Markdown, JSON, and plain text. Future surfaces
+such as settings and folder indexing are represented as disabled commands with
+visible reasons instead of placeholder business logic.
+
+The Model Lab modal is reachable from the command palette and the model manager.
+It shows installed models, last chat usage from `generation_runs`, benchmark
+history from `model_benchmarks`, an active benchmark progress/cancel surface,
+and the fastest measured local model by completion tokens/sec only. It does not
+claim quality rankings or auto-download models.
 
 The sidebar search uses `search_conversations` in the Tauri desktop app. Results
 show conversation title, result source, date, message count, and snippet parts
@@ -614,8 +709,9 @@ into a local browser/WebView download. No dialog plugin or additional Tauri
 capability has been added.
 
 The job status surface shows active jobs and failed jobs. Model pull jobs show
-their label, status, progress bytes when Ollama reports totals, readable errors,
-and a cancel action that calls `cancel_job(job_id)`.
+progress bytes when Ollama reports totals. Model benchmark jobs show fixed-suite
+prompt progress. Both surfaces show readable errors and a cancel action that
+calls `cancel_job(job_id)`.
 
 The first-run readiness surface handles:
 
@@ -661,15 +757,15 @@ The frontend suppresses that cancellation message in the active chat error UI.
 - `src-tauri/src/lib.rs` still mixes chat/export domain types, SQLite
   repositories, chat-generation Ollama HTTP, streaming, cancellation, search,
   export, model pull/delete orchestration, and most Tauri command handlers.
-- Model listing/status and jobs now have partial `domain`, `app`, and `infra`
-  boundaries. SQLite setup/diagnostics and search have `domain` and `infra`
-  modules. Chat, export, and generation are still mostly in `lib.rs`.
+- Model listing/status, jobs, and benchmarks now have partial `domain`, `app`,
+  and `infra` boundaries. SQLite setup/diagnostics and search have `domain` and
+  `infra` modules. Chat, export, and generation are still mostly in `lib.rs`.
 - The frontend still calls many chat `invoke()` commands directly from
   `src/App.tsx`; touched model, export, jobs, diagnostics, and rich search
   commands have typed wrappers.
 - The command registry is centralized in `src/App.tsx`, but it is still coupled
   to local component state and handlers until frontend feature modules exist.
-- Schema setup records current user version 2, but there is not yet an
+- Schema setup records current user version 3, but there is not yet an
   incremental migrations directory for future versions.
 - The SQLite connection is protected by one mutex, so long database work would
   block other database operations.
@@ -684,6 +780,7 @@ The frontend suppresses that cancellation message in the active chat error UI.
 - Model delete still has no progress or cancellation path.
 - `search_chats` remains `LIKE`-based for compatibility, while the primary
   sidebar search now uses FTS5.
+- Model Lab reports speed and latency only; it does not evaluate quality.
 - Raw error strings are shown directly in most UI surfaces.
 
 ## Verification Notes
@@ -704,6 +801,10 @@ modal.
 Chunk 8 adds FTS5-backed `chat_search` and `message_search` tables, idempotent
 backfill/sync triggers, `search_conversations`, highlighted snippet parts, and
 direct message jumps from sidebar search results.
+Chunk 9 adds the persistent `model_benchmarks` table, benchmark service and
+job-backed runner, `start_model_benchmark`, `list_model_benchmarks`,
+`list_model_usage`, and a Model Lab modal for installed models, measured speed,
+latency, history, and cancellation.
 
 Relevant checks:
 
