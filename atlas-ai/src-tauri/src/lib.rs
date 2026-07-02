@@ -6,7 +6,8 @@ use app::{jobs as job_service, models as model_service};
 use domain::database::DatabaseDiagnostics;
 use domain::job::{Job, JobEvent, JobStatus, JobType};
 use domain::model::{validate_ollama_model_name, OllamaModel, OllamaStatus};
-use infra::{jobs as job_repository, ollama, sqlite};
+use domain::search::ChatSearchResult;
+use infra::{jobs as job_repository, ollama, search, sqlite};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -1158,6 +1159,19 @@ fn search_chats(store: State<'_, ChatStore>, query: String) -> Result<Vec<ChatSu
 }
 
 #[tauri::command]
+fn search_conversations(
+    store: State<'_, ChatStore>,
+    query: String,
+    limit: Option<i64>,
+) -> Result<Vec<ChatSearchResult>, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    search::search_conversations(&conn, &query, limit)
+}
+
+#[tauri::command]
 fn create_chat(store: State<'_, ChatStore>, title: Option<String>) -> Result<ChatSummary, String> {
     let conn = store
         .conn
@@ -1607,6 +1621,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_chats,
             search_chats,
+            search_conversations,
             create_chat,
             get_messages,
             add_message,
@@ -1628,7 +1643,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::Connection;
+    use rusqlite::{params, Connection};
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -1639,7 +1654,8 @@ mod tests {
     use super::domain::model::{
         build_ollama_status, validate_ollama_model_name, OllamaModel, OllamaStatusKind,
     };
-    use super::infra::{jobs as job_repository, sqlite};
+    use super::domain::search::SearchResultSource;
+    use super::infra::{jobs as job_repository, search, sqlite};
     use super::{
         calculate_tokens_per_second, escape_like_pattern, format_timestamp_ms, nanos_to_millis,
         normalize_title, render_chat_export, sanitize_file_name, ChatExportFormat, ChatMessage,
@@ -1869,18 +1885,86 @@ mod tests {
         sqlite::setup_database(&conn).unwrap();
         let diagnostics = sqlite::diagnostics(&conn, &db_path).unwrap();
 
-        assert_eq!(diagnostics.user_version, 1);
+        assert_eq!(diagnostics.user_version, 2);
         assert_eq!(diagnostics.journal_mode, "wal");
         assert_eq!(diagnostics.integrity_check, "ok");
         assert!(diagnostics
             .table_counts
             .iter()
             .any(|table| table.table_name == "jobs" && table.row_count == 0));
+        assert!(diagnostics
+            .table_counts
+            .iter()
+            .any(|table| table.table_name == "message_search" && table.row_count == 0));
 
         drop(conn);
         let _ = fs::remove_file(&db_path);
         let _ = fs::remove_file(format!("{}-wal", db_path.display()));
         let _ = fs::remove_file(format!("{}-shm", db_path.display()));
+    }
+
+    #[test]
+    fn fts_search_backfills_highlights_and_cleans_deleted_chats() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA foreign_keys = ON;
+
+            CREATE TABLE chats (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE messages (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+              role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system')),
+              content TEXT NOT NULL,
+              created_at INTEGER NOT NULL
+            );
+
+            INSERT INTO chats (id, title, created_at, updated_at)
+            VALUES ('chat-1', 'Rust Search Notes', 1704067200000, 1704067200000);
+
+            INSERT INTO messages (chat_id, role, content, created_at)
+            VALUES ('chat-1', 'user', 'This migration plan includes FTS snippets.', 1704067200000);
+            ",
+        )
+        .unwrap();
+
+        sqlite::setup_database(&conn).unwrap();
+
+        let message_results = search::search_conversations(&conn, "migration", Some(10)).unwrap();
+        let message_result = message_results
+            .iter()
+            .find(|result| matches!(result.source, SearchResultSource::Message))
+            .expect("expected message search result");
+
+        assert_eq!(message_result.chat_id, "chat-1");
+        assert_eq!(message_result.message_id, Some(1));
+        assert!(message_result
+            .snippet
+            .iter()
+            .any(|part| part.is_match && part.text.eq_ignore_ascii_case("migration")));
+
+        let title_results = search::search_conversations(&conn, "rust", Some(10)).unwrap();
+        assert!(title_results.iter().any(|result| matches!(
+            result.source,
+            SearchResultSource::Title
+        ) && result.chat_id == "chat-1"
+            && result.message_id.is_none()));
+
+        conn.execute("DELETE FROM chats WHERE id = ?1", params!["chat-1"])
+            .unwrap();
+
+        assert!(search::search_conversations(&conn, "migration", Some(10))
+            .unwrap()
+            .is_empty());
+        assert!(search::search_conversations(&conn, "rust", Some(10))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

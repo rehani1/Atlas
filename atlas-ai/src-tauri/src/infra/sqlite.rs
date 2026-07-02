@@ -3,15 +3,16 @@ use std::{fs, path::Path, time::Duration};
 
 use crate::{
     domain::database::{DatabaseDiagnostics, DatabaseTableCount},
-    infra::jobs,
+    infra::{jobs, search},
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 pub(crate) fn setup_database(conn: &Connection) -> Result<(), rusqlite::Error> {
     configure_connection(conn)?;
     create_current_schema(conn)?;
     jobs::create_schema(conn)?;
+    search::create_schema(conn)?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
 
     Ok(())
@@ -91,10 +92,17 @@ pub(crate) fn diagnostics(
     conn: &Connection,
     db_path: &Path,
 ) -> Result<DatabaseDiagnostics, rusqlite::Error> {
-    let table_counts = ["chats", "messages", "generation_runs", "jobs"]
-        .into_iter()
-        .map(|table_name| table_count(conn, table_name))
-        .collect::<Result<Vec<_>, _>>()?;
+    let table_counts = [
+        "chats",
+        "messages",
+        "generation_runs",
+        "jobs",
+        "chat_search",
+        "message_search",
+    ]
+    .into_iter()
+    .map(|table_name| table_count(conn, table_name))
+    .collect::<Result<Vec<_>, _>>()?;
     let journal_mode = conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
     let user_version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let page_count = conn.pragma_query_value(None, "page_count", |row| row.get(0))?;

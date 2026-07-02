@@ -15,9 +15,11 @@ import {
   getDatabaseDiagnostics,
   getOllamaStatus,
   listJobs,
+  searchConversations,
   type ChatExport,
   type ChatExportFormat,
   type ChatMessage,
+  type ChatSearchResult,
   type DatabaseDiagnostics,
   type GenerationRun,
   type Job,
@@ -171,6 +173,21 @@ function formatCount(count: number | null | undefined) {
 
 function formatTokensPerSecond(value: number | null | undefined) {
   return value === null || value === undefined ? null : `${value.toFixed(1)} tok/s`
+}
+
+function formatSearchTimestamp(timestamp: number) {
+  return new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: 'numeric',
+  }).format(new Date(timestamp))
+}
+
+function searchResultSourceLabel(result: ChatSearchResult) {
+  if (result.source === 'title') {
+    return 'Title match'
+  }
+
+  return result.role ? `${result.role} message` : 'Message match'
 }
 
 function getTimeToFirstToken(run: GenerationRun) {
@@ -861,9 +878,16 @@ function App() {
   const [isExportMenuOpen, setIsExportMenuOpen] = useState(false)
   const [isChatSearchOpen, setIsChatSearchOpen] = useState(false)
   const [chatSearchQuery, setChatSearchQuery] = useState('')
-  const [chatSearchResults, setChatSearchResults] = useState<ChatSummary[]>([])
+  const [chatSearchResults, setChatSearchResults] = useState<ChatSearchResult[]>([])
   const [isChatSearchLoading, setIsChatSearchLoading] = useState(false)
   const [chatSearchError, setChatSearchError] = useState<string | null>(null)
+  const [pendingSearchJump, setPendingSearchJump] = useState<{
+    chatId: string
+    messageId: number
+  } | null>(null)
+  const [highlightedMessageId, setHighlightedMessageId] = useState<number | null>(
+    null,
+  )
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false)
   const [commandQuery, setCommandQuery] = useState('')
   const [activeCommandIndex, setActiveCommandIndex] = useState(0)
@@ -877,6 +901,7 @@ function App() {
   >(null)
   const activeChatIdRef = useRef<string | null>(null)
   const commandInputRef = useRef<HTMLInputElement | null>(null)
+  const messageRefs = useRef<Map<number, HTMLElement>>(new Map())
 
   useEffect(() => {
     activeChatIdRef.current = activeChatId
@@ -1024,6 +1049,42 @@ function App() {
   }, [activeChatId])
 
   useEffect(() => {
+    if (!pendingSearchJump || pendingSearchJump.chatId !== activeChatId) {
+      return
+    }
+
+    const animationFrame = window.requestAnimationFrame(() => {
+      const messageElement = messageRefs.current.get(pendingSearchJump.messageId)
+
+      if (!messageElement) {
+        return
+      }
+
+      messageElement.scrollIntoView({ block: 'center', behavior: 'smooth' })
+      setHighlightedMessageId(pendingSearchJump.messageId)
+      setPendingSearchJump(null)
+    })
+
+    return () => {
+      window.cancelAnimationFrame(animationFrame)
+    }
+  }, [activeChatId, messages, pendingSearchJump])
+
+  useEffect(() => {
+    if (highlightedMessageId === null) {
+      return
+    }
+
+    const timeout = window.setTimeout(() => {
+      setHighlightedMessageId(null)
+    }, 2400)
+
+    return () => {
+      window.clearTimeout(timeout)
+    }
+  }, [highlightedMessageId])
+
+  useEffect(() => {
     function handleKeyDown(event: globalThis.KeyboardEvent) {
       const isCommandShortcut =
         (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k'
@@ -1076,7 +1137,7 @@ function App() {
     const timeout = window.setTimeout(() => {
       setIsChatSearchLoading(true)
 
-      invoke<ChatSummary[]>('search_chats', { query })
+      searchConversations(query)
         .then((results) => {
           if (!ignore) {
             setChatSearchResults(results)
@@ -1281,6 +1342,8 @@ function App() {
     setActiveChatId(null)
     setMessages([])
     setDraft('')
+    setPendingSearchJump(null)
+    setHighlightedMessageId(null)
     setIsExportMenuOpen(false)
     closeChatSearch()
   }
@@ -1292,6 +1355,18 @@ function App() {
   async function handleSelectChat(chatId: string) {
     setActiveChatId(chatId)
     setIsExportMenuOpen(false)
+    setPendingSearchJump(null)
+    closeChatSearch()
+  }
+
+  function handleSelectSearchResult(result: ChatSearchResult) {
+    setActiveChatId(result.chat_id)
+    setIsExportMenuOpen(false)
+    setPendingSearchJump(
+      result.message_id === null
+        ? null
+        : { chatId: result.chat_id, messageId: result.message_id },
+    )
     closeChatSearch()
   }
 
@@ -1472,9 +1547,10 @@ function App() {
 
   const normalizedChatSearch = chatSearchQuery.trim().toLowerCase()
   const hasChatSearch = isChatSearchOpen && normalizedChatSearch.length > 0
+  const hasDesktopChatSearch = hasChatSearch && isTauriRuntime()
   const visibleChats = hasChatSearch
     ? isTauriRuntime()
-      ? chatSearchResults
+      ? []
       : chats.filter((chat) =>
           chat.title.toLowerCase().includes(normalizedChatSearch),
         )
@@ -1683,7 +1759,50 @@ function App() {
                 </p>
               ) : null}
 
-              {visibleChats.length > 0 ? (
+              {hasDesktopChatSearch ? (
+                chatSearchResults.length > 0 ? (
+                  chatSearchResults.map((result) => (
+                    <button
+                      className={`min-w-0 overflow-hidden rounded-lg border-0 px-3 py-2 text-left text-sm transition-colors ${
+                        result.chat_id === activeChatId
+                          ? 'bg-zinc-800 text-zinc-50'
+                          : 'bg-transparent text-zinc-300 hover:bg-zinc-900 hover:text-zinc-50'
+                      }`}
+                      key={`${result.source}:${result.chat_id}:${result.message_id ?? 'title'}`}
+                      type="button"
+                      onClick={() => handleSelectSearchResult(result)}
+                    >
+                      <span className="block truncate font-medium">
+                        {result.chat_title}
+                      </span>
+                      <span className="mt-1 block text-xs text-zinc-500">
+                        {searchResultSourceLabel(result)} -{' '}
+                        {formatSearchTimestamp(result.created_at)} -{' '}
+                        {result.message_count} message
+                        {result.message_count === 1 ? '' : 's'}
+                      </span>
+                      <span className="mt-1 block max-h-10 overflow-hidden text-xs leading-5 text-zinc-400">
+                        {result.snippet.map((part, index) => (
+                          <span
+                            className={
+                              part.is_match
+                                ? 'rounded bg-zinc-700 px-0.5 text-zinc-50'
+                                : undefined
+                            }
+                            key={`${index}:${part.text}`}
+                          >
+                            {part.text}
+                          </span>
+                        ))}
+                      </span>
+                    </button>
+                  ))
+                ) : (
+                  <p className="px-3 text-sm text-zinc-500">
+                    {isChatSearchLoading ? 'Searching...' : 'No matching chats'}
+                  </p>
+                )
+              ) : visibleChats.length > 0 ? (
                 visibleChats.map((chat) => (
                   <button
                     className={`min-h-10 min-w-0 overflow-hidden rounded-lg border-0 px-3 text-left text-sm transition-colors ${
@@ -1992,12 +2111,24 @@ function App() {
 
             {messages.map((message) => (
               <article
-                className={`max-w-[78%] overflow-hidden rounded-2xl px-4 py-3 text-sm leading-6 break-words ${
+                className={`max-w-[78%] overflow-hidden rounded-2xl px-4 py-3 text-sm leading-6 break-words transition-[box-shadow,outline-color] ${
                   message.role === 'user'
                     ? 'ml-auto bg-zinc-100 text-zinc-950'
                     : 'mr-auto bg-zinc-900 text-zinc-100'
+                } ${
+                  highlightedMessageId === message.id
+                    ? 'outline outline-2 outline-zinc-400'
+                    : 'outline outline-0 outline-transparent'
                 }`}
                 key={message.id}
+                ref={(element) => {
+                  if (element) {
+                    messageRefs.current.set(message.id, element)
+                    return
+                  }
+
+                  messageRefs.current.delete(message.id)
+                }}
               >
                 <div>{message.content}</div>
                 {message.role === 'assistant' ? (

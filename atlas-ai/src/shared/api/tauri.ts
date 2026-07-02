@@ -113,6 +113,24 @@ export type DatabaseDiagnostics = {
   table_counts: DatabaseTableCount[]
 }
 
+export type SearchSnippetPart = {
+  text: string
+  is_match: boolean
+}
+
+export type ChatSearchResult = {
+  chat_id: string
+  chat_title: string
+  message_id: number | null
+  role: 'user' | 'assistant' | 'system' | null
+  created_at: number
+  updated_at: number
+  message_count: number
+  source: 'title' | 'message'
+  score: number
+  snippet: SearchSnippetPart[]
+}
+
 const commands = {
   getOllamaStatus: 'get_ollama_status',
   downloadOllamaModel: 'download_ollama_model',
@@ -121,6 +139,7 @@ const commands = {
   listJobs: 'list_jobs',
   cancelJob: 'cancel_job',
   getDatabaseDiagnostics: 'get_database_diagnostics',
+  searchConversations: 'search_conversations',
 } as const
 
 export function getOllamaStatus(selectedModel?: string) {
@@ -151,4 +170,11 @@ export function cancelJob(jobId: string) {
 
 export function getDatabaseDiagnostics() {
   return invoke<DatabaseDiagnostics>(commands.getDatabaseDiagnostics)
+}
+
+export function searchConversations(query: string, limit = 30) {
+  return invoke<ChatSearchResult[]>(commands.searchConversations, {
+    query,
+    limit,
+  })
 }

@@ -13,17 +13,18 @@ Tailwind CSS, SQLite, and Ollama. The current codebase is intentionally compact:
 - Frontend UI and state live in `src/App.tsx`.
 - Most backend state, SQLite repositories, command handlers, streaming, and
   cancellation still live in `src-tauri/src/lib.rs`.
-- Backend service slices now include model management, jobs, and database
-  setup/diagnostics:
+- Backend service slices now include model management, jobs, database
+  setup/diagnostics, and FTS search:
   `src-tauri/src/domain/model.rs`, `src-tauri/src/app/models.rs`,
   `src-tauri/src/domain/job.rs`, `src-tauri/src/app/jobs.rs`,
   `src-tauri/src/infra/jobs.rs`, `src-tauri/src/domain/database.rs`,
+  `src-tauri/src/domain/search.rs`, `src-tauri/src/infra/search.rs`,
   `src-tauri/src/infra/sqlite.rs`, and `src-tauri/src/infra/ollama.rs`.
 - `src-tauri/src/main.rs` only starts `atlas_lib::run()`.
 - Public release docs are `README.md` and `CHANGELOG.md`.
 
 There is a minimal typed frontend API wrapper for touched Ollama status, model
-lifecycle, export, jobs, and database diagnostics commands in
+lifecycle, export, jobs, database diagnostics, and rich search commands in
 `src/shared/api/tauri.ts`. There are no frontend feature folders, Rust
 `commands` module, database migrations directory, document indexing, memory,
 import, or model benchmark surfaces yet.
@@ -59,7 +60,7 @@ Current Tauri permissions are limited to `core:default` in
 
 Rust owns privileged operations:
 
-- SQLite connection, schema setup, diagnostics, and queries.
+- SQLite connection, schema setup, diagnostics, FTS search, and queries.
 - Chat and message persistence.
 - Ollama readiness, model list, pull, delete, and chat requests.
 - Model name validation.
@@ -88,6 +89,7 @@ The backend exposes these Tauri commands:
 ```text
 list_chats() -> Vec<ChatSummary>
 search_chats(query: String) -> Vec<ChatSummary>
+search_conversations(query: String, limit: Option<i64>) -> Vec<ChatSearchResult>
 create_chat(title: Option<String>) -> ChatSummary
 get_messages(chat_id: String) -> Vec<ChatMessage>
 add_message(chat_id: String, role: String, content: String) -> ChatMessage
@@ -197,6 +199,22 @@ DatabaseDiagnostics
 - freelist_count: number
 - integrity_check: string
 - table_counts: DatabaseTableCount[]
+
+SearchSnippetPart
+- text: string
+- is_match: bool
+
+ChatSearchResult
+- chat_id: string
+- chat_title: string
+- message_id: number | null
+- role: "user" | "assistant" | "system" | null
+- created_at: number
+- updated_at: number
+- message_count: number
+- source: "title" | "message"
+- score: number
+- snippet: SearchSnippetPart[]
 ```
 
 The backend emits `job_updated` events for job creation, start, progress,
@@ -215,7 +233,8 @@ The app creates the app-data directory if needed. `ChatStore::new()` opens the
 database and calls `infra::sqlite::setup_database(&conn)`, which configures the
 connection and runs repeatable baseline schema setup. The current
 `chats`/`messages`/`generation_runs`/`jobs` schema is treated as baseline
-version 1 and recorded with `PRAGMA user_version = 1`.
+version 1. Chunk 8 adds FTS search tables and records the current schema as
+`PRAGMA user_version = 2`.
 
 There is no migrations directory yet. Future schema changes should add
 idempotent versions after the v1 baseline instead of editing historical setup in
@@ -298,9 +317,28 @@ CREATE TABLE IF NOT EXISTS jobs (
   completed_at INTEGER,
   cancelled_at INTEGER
 );
+
+CREATE VIRTUAL TABLE IF NOT EXISTS chat_search
+USING fts5(
+  title,
+  chat_id UNINDEXED,
+  created_at UNINDEXED,
+  updated_at UNINDEXED,
+  tokenize = 'unicode61'
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS message_search
+USING fts5(
+  content,
+  chat_id UNINDEXED,
+  message_id UNINDEXED,
+  role UNINDEXED,
+  created_at UNINDEXED,
+  tokenize = 'unicode61'
+);
 ```
 
-Current indexes and trigger:
+Current indexes and triggers:
 
 ```sql
 CREATE INDEX IF NOT EXISTS idx_chats_updated_at
@@ -331,6 +369,17 @@ BEGIN
 END;
 ```
 
+Search indexing behavior:
+
+- `infra::search::create_schema()` creates `chat_search` and `message_search`
+  and runs an idempotent backfill from `chats` and `messages`.
+- `chat_search` is synchronized on chat insert, title/update timestamp changes,
+  and chat delete.
+- `message_search` is synchronized on message insert, message update, message
+  delete, and parent chat delete.
+- Backfill also removes FTS rows whose source chat/message no longer exists, so
+  deleted chats do not leave stale searchable rows.
+
 Persistence behavior:
 
 - Chat IDs are generated in SQLite with `lower(hex(randomblob(16)))`.
@@ -356,8 +405,8 @@ Persistence behavior:
 - WAL mode is enabled for the file-backed desktop database.
 - `get_database_diagnostics` reads the database path, database/WAL/SHM sizes,
   journal mode, schema user version, page counts, free pages, integrity check,
-  and table counts for core tables. It does not export chat content or mutate
-  user data.
+  and table counts for core tables and FTS tables. It does not export chat
+  content or mutate user data.
 
 ## Chat Generation Flow
 
@@ -467,7 +516,7 @@ Current limitations:
 
 ## Search Behavior
 
-`search_chats(query)`:
+`search_chats(query)` remains as a compatibility command:
 
 - Trims the query.
 - Returns `list_chats()` for an empty query.
@@ -476,11 +525,28 @@ Current limitations:
 - Returns `ChatSummary` objects only.
 - Orders results by `updated_at DESC`.
 
+`search_conversations(query, limit)` powers the desktop sidebar search:
+
+- Parses free-text terms into a quoted FTS5 prefix query.
+- Supports title matches through `chat_search`.
+- Supports message-content matches through `message_search`.
+- Supports basic future-compatible filters:
+  `model:<name>`, `has:code`, `chat:<title>`, `from:YYYY-MM-DD`, and
+  `before:YYYY-MM-DD`.
+- Returns `ChatSearchResult` rows with chat ID/title, optional message ID, role,
+  timestamps, message count, result source, rank score, and sanitized snippet
+  parts.
+- Uses SQLite `snippet()` markers only inside Rust and converts them into
+  `SearchSnippetPart[]`; the frontend renders text spans rather than raw HTML.
+- Sorts by FTS rank, then recent chat update time.
+- Limits results to 30 by default and clamps requested limits to 1-100.
+
 Current limitations:
 
-- There is no SQLite FTS table.
-- Results do not include message IDs, snippets, ranks, highlighted ranges,
-  filters, or direct jumps to matching messages.
+- Search filters are intentionally small and token-based; quoted multi-word
+  filter values are not supported yet.
+- Message results can jump directly to a message, but there is not yet a
+  full-page search surface or persistent result history.
 
 ## Frontend State Ownership
 
@@ -502,7 +568,8 @@ Current limitations:
   fuzzy filtering, and disabled command reasons.
 - Generation state, including `isResponding` and `respondingChatId`.
 - Deleting chat state.
-- Chat search panel state, query, loading state, results, and errors.
+- Chat search panel state, query, loading state, rich results, pending message
+  jump, highlighted message, and errors.
 
 Existing stale-state guards:
 
@@ -513,6 +580,9 @@ Existing stale-state guards:
   unrelated jobs.
 - `activeChatIdRef` guards against appending/reloading assistant messages into a
   chat that is no longer active.
+- Search result jumps are scoped by `chat_id` and `message_id`, so selecting a
+  result changes active chat first and scrolls only after the matching message
+  has rendered.
 - `respondingChatId` scopes the visible progress indicator and cancellation.
 
 Browser preview behavior is explicit: when not running in Tauri, chat responses
@@ -526,6 +596,12 @@ diagnostics, and active chat deletion when valid. It also exposes active-chat
 export commands for Markdown, JSON, and plain text. Future surfaces such as
 settings, Model Lab, and folder indexing are represented as disabled commands
 with visible reasons instead of placeholder business logic.
+
+The sidebar search uses `search_conversations` in the Tauri desktop app. Results
+show conversation title, result source, date, message count, and snippet parts
+with highlighted matches. Selecting a message result opens the conversation,
+scrolls to that message, and briefly outlines it. Browser preview mode keeps the
+old title-only local filter.
 
 The diagnostics command opens a focused database diagnostics modal in desktop
 mode. It shows SQLite path, database/WAL/SHM sizes, journal mode, schema version,
@@ -586,15 +662,15 @@ The frontend suppresses that cancellation message in the active chat error UI.
   repositories, chat-generation Ollama HTTP, streaming, cancellation, search,
   export, model pull/delete orchestration, and most Tauri command handlers.
 - Model listing/status and jobs now have partial `domain`, `app`, and `infra`
-  boundaries. SQLite setup/diagnostics has `domain` and `infra` modules. Chat,
-  search, export, and generation are still mostly in `lib.rs`.
-- The frontend still calls many chat/search `invoke()` commands directly from
-  `src/App.tsx`; touched model, export, jobs, and diagnostics commands have
-  typed wrappers.
+  boundaries. SQLite setup/diagnostics and search have `domain` and `infra`
+  modules. Chat, export, and generation are still mostly in `lib.rs`.
+- The frontend still calls many chat `invoke()` commands directly from
+  `src/App.tsx`; touched model, export, jobs, diagnostics, and rich search
+  commands have typed wrappers.
 - The command registry is centralized in `src/App.tsx`, but it is still coupled
   to local component state and handlers until frontend feature modules exist.
-- Schema setup records baseline version 1, but there is not yet an incremental
-  migrations directory for future versions.
+- Schema setup records current user version 2, but there is not yet an
+  incremental migrations directory for future versions.
 - The SQLite connection is protected by one mutex, so long database work would
   block other database operations.
 - Database diagnostics are a focused modal, not the full diagnostics center
@@ -606,7 +682,8 @@ The frontend suppresses that cancellation message in the active chat error UI.
 - Failed runs with no assistant text are persisted but only surface as inline
   `historyError` in the current UI.
 - Model delete still has no progress or cancellation path.
-- Search uses `LIKE`, so result quality and scalability are limited.
+- `search_chats` remains `LIKE`-based for compatibility, while the primary
+  sidebar search now uses FTS5.
 - Raw error strings are shown directly in most UI surfaces.
 
 ## Verification Notes
@@ -624,6 +701,9 @@ Chunk 7 moves SQLite setup into `infra::sqlite`, treats the current schema as
 baseline user version 1, enables WAL, keeps indexes scoped to current query
 paths, and adds a read-only database diagnostics command plus command-palette
 modal.
+Chunk 8 adds FTS5-backed `chat_search` and `message_search` tables, idempotent
+backfill/sync triggers, `search_conversations`, highlighted snippet parts, and
+direct message jumps from sidebar search results.
 
 Relevant checks:
 
