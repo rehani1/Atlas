@@ -3,19 +3,23 @@ mod domain;
 mod infra;
 
 use app::{
-    benchmarks as benchmark_service, jobs as job_service, memories as memory_service,
-    models as model_service, summaries as summary_service,
+    benchmarks as benchmark_service, jobs as job_service, knowledge as knowledge_service,
+    memories as memory_service, models as model_service, summaries as summary_service,
 };
 use domain::benchmark::{ModelBenchmark, ModelUsage};
 use domain::database::DatabaseDiagnostics;
 use domain::job::{Job, JobEvent, JobStatus, JobType};
+use domain::knowledge::{
+    DocumentSearchResult, GenerationDocumentSourceUse, KnowledgeChunk, KnowledgeDocument,
+    KnowledgePromptSetting, KnowledgeWorkspace,
+};
 use domain::memory::{Memory, MemoryPromptSetting, MemoryScopeType, PromptMemoryUse};
 use domain::model::{validate_ollama_model_name, OllamaModel, OllamaStatus};
 use domain::search::ChatSearchResult;
 use domain::summary::{ConversationSummary, SummarySourceMessage};
 use infra::{
-    benchmarks::CompletedBenchmarkMetrics, jobs as job_repository, memories as memory_repository,
-    ollama, search, sqlite,
+    benchmarks::CompletedBenchmarkMetrics, jobs as job_repository,
+    knowledge as knowledge_repository, memories as memory_repository, ollama, search, sqlite,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
@@ -95,6 +99,7 @@ struct GenerationRun {
     tokens_per_second: Option<f64>,
     error_message: Option<String>,
     memory_uses: Vec<PromptMemoryUse>,
+    document_sources: Vec<GenerationDocumentSourceUse>,
 }
 
 #[derive(Copy, Clone, Debug, Deserialize, PartialEq)]
@@ -628,6 +633,38 @@ fn memory_prompt_context(memories: &[Memory]) -> OllamaChatMessage {
     }
 }
 
+fn document_prompt_context(sources: &[GenerationDocumentSourceUse]) -> OllamaChatMessage {
+    let mut content = String::from(
+        "The user enabled Atlas local knowledge for this chat. Answer from the provided source excerpts when they are relevant. Cite sources with their bracketed IDs like [S1]. Do not invent citations. If these sources are insufficient, say that the indexed sources do not contain enough information.\n\n",
+    );
+
+    for source in sources {
+        content.push_str(&format!(
+            "[{}] {} lines {}-{} (document_id={}, chunk_id={})\n{}\n\n",
+            source.source_id,
+            source.file_name,
+            source.start_line,
+            source.end_line,
+            source.document_id.as_deref().unwrap_or("unknown"),
+            source.chunk_id.as_deref().unwrap_or("unknown"),
+            source.content
+        ));
+    }
+
+    OllamaChatMessage {
+        role: "system".to_string(),
+        content,
+    }
+}
+
+fn latest_user_query(messages: &[ChatMessage]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.clone())
+}
+
 fn update_conversation_summary_progress(
     store: &ChatStore,
     app: &AppHandle,
@@ -830,6 +867,199 @@ fn run_conversation_summary_job(
     }
 }
 
+fn update_document_import_progress(
+    store: &ChatStore,
+    app: &AppHandle,
+    job_id: &str,
+    workspace_name: &str,
+    progress_current: i64,
+    progress_total: i64,
+) -> Result<(), String> {
+    let label = if progress_current >= progress_total {
+        format!("Indexed {workspace_name}")
+    } else {
+        format!("Indexing {workspace_name}")
+    };
+    let job = {
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        job_service::update_progress(
+            &conn,
+            job_id,
+            Some(progress_current),
+            Some(progress_total),
+            Some(&label),
+        )?
+    };
+
+    emit_job_event(app, &job)
+}
+
+fn finish_document_import_cancelled(
+    store: &ChatStore,
+    job_id: &str,
+    completed_at: i64,
+) -> Result<Job, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    job_service::finish_cancelled(&conn, job_id, completed_at)
+}
+
+fn finish_document_import_failed(
+    store: &ChatStore,
+    job_id: &str,
+    completed_at: i64,
+    error_message: &str,
+) -> Result<Job, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    job_service::finish_failed(&conn, job_id, error_message, completed_at)
+}
+
+fn run_document_import_job(
+    store: ChatStore,
+    app: AppHandle,
+    job_id: String,
+    input_path: String,
+    cancellation: Arc<AtomicBool>,
+) -> Result<Job, String> {
+    let running_job = {
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        job_service::start(&conn, &job_id, now_millis()?)?
+    };
+    emit_job_event(&app, &running_job)?;
+
+    let validated_path = match knowledge_service::validate_path(&input_path) {
+        Ok(validated_path) => validated_path,
+        Err(error) => {
+            let completed_at = now_millis()?;
+            let final_job = finish_document_import_failed(&store, &job_id, completed_at, &error)?;
+            emit_job_event(&app, &final_job)?;
+            return Ok(final_job);
+        }
+    };
+
+    if cancellation.load(Ordering::SeqCst) {
+        let completed_at = now_millis()?;
+        let final_job = finish_document_import_cancelled(&store, &job_id, completed_at)?;
+        emit_job_event(&app, &final_job)?;
+        return Ok(final_job);
+    }
+
+    let workspace = {
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        knowledge_service::create_or_update_workspace(&conn, &validated_path, now_millis()?)?
+    };
+
+    let files = match knowledge_service::discover_files(&validated_path, &cancellation) {
+        Ok(files) => files,
+        Err(error) if error == "Job cancelled" || cancellation.load(Ordering::SeqCst) => {
+            let completed_at = now_millis()?;
+            let final_job = finish_document_import_cancelled(&store, &job_id, completed_at)?;
+            emit_job_event(&app, &final_job)?;
+            return Ok(final_job);
+        }
+        Err(error) => {
+            let completed_at = now_millis()?;
+            let final_job = finish_document_import_failed(&store, &job_id, completed_at, &error)?;
+            emit_job_event(&app, &final_job)?;
+            return Ok(final_job);
+        }
+    };
+
+    let progress_total = files.len() as i64;
+    update_document_import_progress(&store, &app, &job_id, &workspace.name, 0, progress_total)?;
+
+    let mut stats = knowledge_service::empty_index_stats(&workspace.id);
+    stats.discovered_files = progress_total;
+    let mut active_paths = Vec::new();
+
+    for (index, file_path) in files.iter().enumerate() {
+        if cancellation.load(Ordering::SeqCst) {
+            let completed_at = now_millis()?;
+            let final_job = finish_document_import_cancelled(&store, &job_id, completed_at)?;
+            emit_job_event(&app, &final_job)?;
+            return Ok(final_job);
+        }
+
+        let outcome = {
+            let conn = store
+                .conn
+                .lock()
+                .map_err(|_| "Database lock was poisoned".to_string())?;
+            knowledge_service::index_file(&conn, &workspace.id, file_path, now_millis()?)
+        };
+
+        match outcome {
+            Ok(knowledge_service::FileIndexOutcome::Indexed { path, chunk_count }) => {
+                active_paths.push(path);
+                stats.indexed_files += 1;
+                stats.chunk_count += chunk_count;
+            }
+            Ok(knowledge_service::FileIndexOutcome::Unchanged { path }) => {
+                active_paths.push(path);
+                stats.unchanged_files += 1;
+            }
+            Ok(knowledge_service::FileIndexOutcome::Skipped) | Err(_) => {
+                stats.skipped_files += 1;
+            }
+        }
+
+        update_document_import_progress(
+            &store,
+            &app,
+            &job_id,
+            &workspace.name,
+            (index + 1) as i64,
+            progress_total,
+        )?;
+    }
+
+    if cancellation.load(Ordering::SeqCst) {
+        let completed_at = now_millis()?;
+        let final_job = finish_document_import_cancelled(&store, &job_id, completed_at)?;
+        emit_job_event(&app, &final_job)?;
+        return Ok(final_job);
+    }
+
+    stats.removed_files = {
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        knowledge_service::mark_missing_documents_deleted(
+            &conn,
+            &workspace.id,
+            &active_paths,
+            now_millis()?,
+        )?
+    };
+
+    let completed_at = now_millis()?;
+    let result_json = serde_json::to_string(&stats).map_err(|error| error.to_string())?;
+    let final_job = {
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        job_service::finish_succeeded(&conn, &job_id, Some(&result_json), completed_at)?
+    };
+    emit_job_event(&app, &final_job)?;
+    Ok(final_job)
+}
+
 fn nanos_to_millis(nanos: Option<i64>) -> Option<i64> {
     nanos.map(|nanos| ((nanos as f64) / 1_000_000.0).round() as i64)
 }
@@ -1011,6 +1241,16 @@ fn append_generation_markdown(output: &mut String, run: &GenerationRun) {
     if let Some(error_message) = &run.error_message {
         output.push_str(&format!("- Error: {error_message}\n"));
     }
+
+    if !run.document_sources.is_empty() {
+        output.push_str("- Sources:\n");
+        for source in &run.document_sources {
+            output.push_str(&format!(
+                "  - [{}] `{}` lines {}-{}\n",
+                source.source_id, source.file_name, source.start_line, source.end_line
+            ));
+        }
+    }
 }
 
 fn append_generation_text(output: &mut String, run: &GenerationRun) {
@@ -1040,6 +1280,21 @@ fn append_generation_text(output: &mut String, run: &GenerationRun) {
 
     if let Some(error_message) = &run.error_message {
         details.push(format!("error: {error_message}"));
+    }
+
+    if !run.document_sources.is_empty() {
+        let sources = run
+            .document_sources
+            .iter()
+            .map(|source| {
+                format!(
+                    "[{}] {}:{}-{}",
+                    source.source_id, source.file_name, source.start_line, source.end_line
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        details.push(format!("sources: {sources}"));
     }
 
     output.push_str(&format!("Generation: {}\n", details.join("; ")));
@@ -1239,6 +1494,7 @@ fn read_generation_run(
             tokens_per_second: row.get(offset + 14)?,
             error_message: row.get(offset + 15)?,
             memory_uses: Vec::new(),
+            document_sources: Vec::new(),
         }),
         None => None,
     })
@@ -1478,6 +1734,8 @@ fn list_messages_for_chat(
     for message in &mut messages {
         if let Some(run) = &mut message.generation_run {
             run.memory_uses = memory_repository::list_generation_uses(conn, &run.id)?;
+            run.document_sources =
+                knowledge_repository::list_generation_source_uses(conn, &run.id)?;
         }
     }
 
@@ -1544,6 +1802,7 @@ fn read_generation_run_required(row: &Row<'_>) -> Result<GenerationRun, rusqlite
         tokens_per_second: row.get(14)?,
         error_message: row.get(15)?,
         memory_uses: Vec::new(),
+        document_sources: Vec::new(),
     })
 }
 
@@ -1994,6 +2253,93 @@ fn set_memory_prompt_enabled(
 }
 
 #[tauri::command]
+fn list_knowledge_workspaces(
+    store: State<'_, ChatStore>,
+) -> Result<Vec<KnowledgeWorkspace>, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    knowledge_service::list_workspaces(&conn)
+}
+
+#[tauri::command]
+fn remove_knowledge_workspace(
+    store: State<'_, ChatStore>,
+    workspace_id: String,
+) -> Result<bool, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    knowledge_service::remove_workspace(&conn, &workspace_id)
+}
+
+#[tauri::command]
+fn list_knowledge_documents(
+    store: State<'_, ChatStore>,
+    limit: Option<i64>,
+) -> Result<Vec<KnowledgeDocument>, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    knowledge_service::list_documents(&conn, limit)
+}
+
+#[tauri::command]
+fn search_knowledge_documents(
+    store: State<'_, ChatStore>,
+    query: String,
+    limit: Option<i64>,
+) -> Result<Vec<DocumentSearchResult>, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    knowledge_service::search_documents(&conn, &query, limit)
+}
+
+#[tauri::command]
+fn get_knowledge_chunk(
+    store: State<'_, ChatStore>,
+    chunk_id: String,
+) -> Result<KnowledgeChunk, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    knowledge_service::get_chunk(&conn, &chunk_id)
+}
+
+#[tauri::command]
+fn get_knowledge_prompt_setting(
+    store: State<'_, ChatStore>,
+    chat_id: String,
+) -> Result<KnowledgePromptSetting, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    require_chat(&conn, &chat_id)?;
+    knowledge_service::prompt_setting(&conn, &chat_id)
+}
+
+#[tauri::command]
+fn set_knowledge_prompt_enabled(
+    store: State<'_, ChatStore>,
+    chat_id: String,
+    enabled_for_prompt: bool,
+) -> Result<KnowledgePromptSetting, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    require_chat(&conn, &chat_id)?;
+    knowledge_service::set_prompt_enabled(&conn, &chat_id, enabled_for_prompt, now_millis()?)
+}
+
+#[tauri::command]
 fn add_message(
     store: State<'_, ChatStore>,
     chat_id: String,
@@ -2167,6 +2513,93 @@ fn cancel_job(
 
     emit_job_event(&app, &job)?;
     Ok(job)
+}
+
+#[tauri::command]
+async fn index_knowledge_path(
+    app: AppHandle,
+    store: State<'_, ChatStore>,
+    tasks: State<'_, JobTasks>,
+    path: String,
+) -> Result<Job, String> {
+    let validated_path = knowledge_service::validate_path(&path)?;
+    let canonical_path = validated_path.root_path.display().to_string();
+    let payload_json = serde_json::json!({
+      "path": &canonical_path,
+      "supported_extensions": knowledge_service::supported_extensions()
+    })
+    .to_string();
+    let now = now_millis()?;
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let job = {
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        let job = job_service::create(
+            &conn,
+            JobType::DocumentImport,
+            &format!("Queued index for {}", validated_path.name),
+            Some(&payload_json),
+            now,
+        )?;
+        tasks
+            .tasks
+            .lock()
+            .map_err(|_| "Job task lock was poisoned".to_string())?
+            .insert(job.id.clone(), cancellation.clone());
+        job
+    };
+
+    if let Err(error) = emit_job_event(&app, &job) {
+        tasks
+            .tasks
+            .lock()
+            .map_err(|_| "Job task lock was poisoned".to_string())?
+            .remove(&job.id);
+        return Err(error);
+    }
+
+    let store_for_job = store.inner().clone();
+    let app_for_job = app.clone();
+    let job_id = job.id.clone();
+    let job_id_for_cleanup = job.id.clone();
+    let cancellation_for_job = cancellation.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        run_document_import_job(
+            store_for_job,
+            app_for_job,
+            job_id,
+            canonical_path,
+            cancellation_for_job,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string());
+
+    {
+        let mut tasks = tasks
+            .tasks
+            .lock()
+            .map_err(|_| "Job task lock was poisoned".to_string())?;
+        if tasks
+            .get(&job_id_for_cleanup)
+            .is_some_and(|current_task| Arc::ptr_eq(current_task, &cancellation))
+        {
+            tasks.remove(&job_id_for_cleanup);
+        }
+    }
+
+    let final_job = result??;
+    match final_job.status {
+        JobStatus::Succeeded => Ok(final_job),
+        JobStatus::Cancelled => Err("Job cancelled".to_string()),
+        JobStatus::Failed => Err(final_job
+            .error_message
+            .clone()
+            .unwrap_or_else(|| "Job failed".to_string())),
+        _ => Ok(final_job),
+    }
 }
 
 #[tauri::command]
@@ -2536,7 +2969,7 @@ async fn generate_assistant_response(
 ) -> Result<ChatMessage, String> {
     let model = validate_ollama_model_name(&model)?;
     let started_at = now_millis()?;
-    let (messages, prompt_summary, prompt_memories) = {
+    let (messages, prompt_summary, prompt_memories, prompt_knowledge_enabled, knowledge_query) = {
         let conn = store
             .conn
             .lock()
@@ -2555,7 +2988,15 @@ async fn generate_assistant_response(
         } else {
             Vec::new()
         };
-        (messages, prompt_summary, prompt_memories)
+        let knowledge_setting = knowledge_service::prompt_setting(&conn, &chat_id)?;
+        let knowledge_query = latest_user_query(&messages).unwrap_or_default();
+        (
+            messages,
+            prompt_summary,
+            prompt_memories,
+            knowledge_setting.enabled_for_prompt,
+            knowledge_query,
+        )
     };
     let run_id = {
         let conn = store
@@ -2573,6 +3014,23 @@ async fn generate_assistant_response(
             .map_err(|_| "Database lock was poisoned".to_string())?;
         memory_service::record_generation_uses(&conn, &run_id, &prompt_memories, started_at)?
     };
+    let document_sources = if prompt_knowledge_enabled {
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        let chunks = knowledge_service::retrieve_prompt_chunks(&conn, &knowledge_query)?;
+        knowledge_service::record_generation_sources(
+            &conn,
+            &chat_id,
+            &run_id,
+            &knowledge_query,
+            &chunks,
+            started_at,
+        )?
+    } else {
+        Vec::new()
+    };
     let mut ollama_messages = Vec::with_capacity(
         messages.len()
             + usize::from(prompt_summary.is_some())
@@ -2583,6 +3041,14 @@ async fn generate_assistant_response(
     }
     if !prompt_memories.is_empty() {
         ollama_messages.push(memory_prompt_context(&prompt_memories));
+    }
+    if !document_sources.is_empty() {
+        ollama_messages.push(document_prompt_context(&document_sources));
+    } else if prompt_knowledge_enabled {
+        ollama_messages.push(OllamaChatMessage {
+            role: "system".to_string(),
+            content: "The user enabled Atlas local knowledge for this chat, but no matching indexed source chunks were retrieved for this message. Do not invent file citations; if the answer depends on local files, say the indexed sources do not contain enough information.".to_string(),
+        });
     }
     ollama_messages.extend(messages.into_iter().map(|message| OllamaChatMessage {
         role: message.role,
@@ -2654,6 +3120,7 @@ async fn generate_assistant_response(
             let mut message = insert_message(&conn, &chat_id, "assistant", &result.content)?;
             let mut run = update_generation_run(&conn, &run_id, Some(message.id), &completion)?;
             run.memory_uses = memory_uses;
+            run.document_sources = document_sources;
             message.generation_run = Some(run);
             Ok(message)
         }
@@ -2702,6 +3169,7 @@ async fn generate_assistant_response(
             let run = match update_generation_run(&conn, &run_id, Some(message.id), &completion) {
                 Ok(mut run) => {
                     run.memory_uses = memory_uses;
+                    run.document_sources = document_sources;
                     run
                 }
                 Err(update_error) => {
@@ -2769,6 +3237,13 @@ pub fn run() {
             delete_memory,
             get_memory_prompt_setting,
             set_memory_prompt_enabled,
+            list_knowledge_workspaces,
+            remove_knowledge_workspace,
+            list_knowledge_documents,
+            search_knowledge_documents,
+            get_knowledge_chunk,
+            get_knowledge_prompt_setting,
+            set_knowledge_prompt_enabled,
             add_message,
             delete_chat,
             export_chat,
@@ -2779,6 +3254,7 @@ pub fn run() {
             list_model_benchmarks,
             list_model_usage,
             cancel_job,
+            index_knowledge_path,
             start_model_benchmark,
             generate_conversation_summary,
             download_ollama_model,
@@ -2795,12 +3271,13 @@ mod tests {
     use rusqlite::{params, Connection};
     use std::{
         fs,
+        sync::atomic::AtomicBool,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::app::{
-        benchmarks as benchmark_service, jobs as job_service, memories as memory_service,
-        summaries as summary_service,
+        benchmarks as benchmark_service, jobs as job_service, knowledge as knowledge_service,
+        memories as memory_service, summaries as summary_service,
     };
     use super::domain::benchmark::ModelBenchmarkStatus;
     use super::domain::job::{JobStatus, JobType};
@@ -2811,7 +3288,8 @@ mod tests {
     use super::domain::search::SearchResultSource;
     use super::infra::{
         benchmarks::{self as benchmark_repository, CompletedBenchmarkMetrics},
-        jobs as job_repository, memories as memory_repository, search, sqlite,
+        jobs as job_repository, knowledge as knowledge_repository, memories as memory_repository,
+        search, sqlite,
     };
     use super::{
         calculate_tokens_per_second, create_generation_run, escape_like_pattern,
@@ -2954,6 +3432,7 @@ mod tests {
                     tokens_per_second: Some(60.0),
                     error_message: Some("Generation failed".to_string()),
                     memory_uses: Vec::new(),
+                    document_sources: Vec::new(),
                 }),
             },
         ];
@@ -3226,6 +3705,119 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_service_indexes_searches_and_records_sources() {
+        let conn = Connection::open_in_memory().unwrap();
+        sqlite::setup_database(&conn).unwrap();
+        conn.execute(
+            "
+            INSERT INTO chats (id, title, created_at, updated_at)
+            VALUES ('chat-1', 'Knowledge Check', 100, 100)
+            ",
+            [],
+        )
+        .unwrap();
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace_path = std::env::temp_dir().join(format!("atlas-knowledge-test-{unique}"));
+        fs::create_dir_all(&workspace_path).unwrap();
+        let notes_path = workspace_path.join("notes.md");
+        fs::write(
+            &notes_path,
+            "# Atlas Notes\n\nSQLite WAL keeps local chat storage responsive.\n\nRust services own path validation.",
+        )
+        .unwrap();
+        fs::write(workspace_path.join("ignored.bin"), b"\0\0\0").unwrap();
+
+        let validated = knowledge_service::validate_path(workspace_path.to_str().unwrap()).unwrap();
+        let files = knowledge_service::discover_files(&validated, &AtomicBool::new(false)).unwrap();
+        assert_eq!(files, vec![notes_path.canonicalize().unwrap()]);
+
+        let workspace =
+            knowledge_service::create_or_update_workspace(&conn, &validated, 150).unwrap();
+        let outcome = knowledge_service::index_file(&conn, &workspace.id, &files[0], 175).unwrap();
+        let active_path = match outcome {
+            knowledge_service::FileIndexOutcome::Indexed { path, chunk_count } => {
+                assert!(chunk_count > 0);
+                path
+            }
+            _ => panic!("expected indexed document"),
+        };
+        assert_eq!(
+            knowledge_service::mark_missing_documents_deleted(
+                &conn,
+                &workspace.id,
+                std::slice::from_ref(&active_path),
+                200,
+            )
+            .unwrap(),
+            0
+        );
+
+        let results = knowledge_service::search_documents(&conn, "SQLite WAL", Some(10)).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file_name, "notes.md");
+        assert!(results[0].content.contains("SQLite WAL"));
+
+        let default_setting = knowledge_service::prompt_setting(&conn, "chat-1").unwrap();
+        assert!(!default_setting.enabled_for_prompt);
+        let setting = knowledge_service::set_prompt_enabled(&conn, "chat-1", true, 225).unwrap();
+        assert!(setting.enabled_for_prompt);
+
+        let run_id = create_generation_run(&conn, "chat-1", "llama3.2:3b", 250).unwrap();
+        let prompt_chunks =
+            knowledge_service::retrieve_prompt_chunks(&conn, "How does SQLite WAL help?").unwrap();
+        assert_eq!(prompt_chunks.len(), 1);
+        let uses = knowledge_service::record_generation_sources(
+            &conn,
+            "chat-1",
+            &run_id,
+            "How does SQLite WAL help?",
+            &prompt_chunks,
+            275,
+        )
+        .unwrap();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].source_id, "S1");
+        assert_eq!(uses[0].file_name, "notes.md");
+
+        let listed_uses =
+            knowledge_repository::list_generation_source_uses(&conn, &run_id).unwrap();
+        assert_eq!(listed_uses.len(), 1);
+        assert_eq!(
+            listed_uses[0].chunk_id.as_deref(),
+            uses[0].chunk_id.as_deref()
+        );
+
+        let unchanged =
+            knowledge_service::index_file(&conn, &workspace.id, &files[0], 300).unwrap();
+        assert!(matches!(
+            unchanged,
+            knowledge_service::FileIndexOutcome::Unchanged { .. }
+        ));
+        let chunk_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM document_chunks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(chunk_count, 1);
+
+        fs::remove_file(&notes_path).unwrap();
+        assert_eq!(
+            knowledge_service::mark_missing_documents_deleted(&conn, &workspace.id, &[], 325)
+                .unwrap(),
+            1
+        );
+        assert!(
+            knowledge_service::search_documents(&conn, "SQLite", Some(10))
+                .unwrap()
+                .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(&workspace_path);
+    }
+
+    #[test]
     fn sqlite_setup_enables_wal_and_reports_safe_diagnostics() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3237,7 +3829,7 @@ mod tests {
         sqlite::setup_database(&conn).unwrap();
         let diagnostics = sqlite::diagnostics(&conn, &db_path).unwrap();
 
-        assert_eq!(diagnostics.user_version, 5);
+        assert_eq!(diagnostics.user_version, 6);
         assert_eq!(diagnostics.journal_mode, "wal");
         assert_eq!(diagnostics.integrity_check, "ok");
         assert!(diagnostics
@@ -3268,6 +3860,28 @@ mod tests {
             .table_counts
             .iter()
             .any(|table| { table.table_name == "generation_memory_uses" && table.row_count == 0 }));
+        assert!(diagnostics
+            .table_counts
+            .iter()
+            .any(|table| table.table_name == "workspaces" && table.row_count == 0));
+        assert!(diagnostics
+            .table_counts
+            .iter()
+            .any(|table| table.table_name == "documents" && table.row_count == 0));
+        assert!(diagnostics
+            .table_counts
+            .iter()
+            .any(|table| table.table_name == "document_chunks" && table.row_count == 0));
+        assert!(diagnostics.table_counts.iter().any(|table| {
+            table.table_name == "knowledge_prompt_settings" && table.row_count == 0
+        }));
+        assert!(diagnostics
+            .table_counts
+            .iter()
+            .any(|table| table.table_name == "retrieval_runs" && table.row_count == 0));
+        assert!(diagnostics.table_counts.iter().any(|table| {
+            table.table_name == "generation_document_sources" && table.row_count == 0
+        }));
 
         drop(conn);
         let _ = fs::remove_file(&db_path);

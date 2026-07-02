@@ -14,25 +14,27 @@ Tailwind CSS, SQLite, and Ollama. The current codebase is intentionally compact:
 - Most backend state, SQLite repositories, command handlers, streaming, and
   cancellation still live in `src-tauri/src/lib.rs`.
 - Backend service slices now include model management, jobs, database
-  setup/diagnostics, FTS search, model benchmarks, summaries, and memories:
+  setup/diagnostics, FTS search, model benchmarks, summaries, memories, and
+  local knowledge indexing:
   `src-tauri/src/domain/model.rs`, `src-tauri/src/app/models.rs`,
   `src-tauri/src/domain/job.rs`, `src-tauri/src/app/jobs.rs`,
   `src-tauri/src/domain/benchmark.rs`, `src-tauri/src/app/benchmarks.rs`,
   `src-tauri/src/domain/summary.rs`, `src-tauri/src/app/summaries.rs`,
   `src-tauri/src/domain/memory.rs`, `src-tauri/src/app/memories.rs`,
+  `src-tauri/src/domain/knowledge.rs`, `src-tauri/src/app/knowledge.rs`,
   `src-tauri/src/infra/jobs.rs`, `src-tauri/src/domain/database.rs`,
   `src-tauri/src/domain/search.rs`, `src-tauri/src/infra/search.rs`,
   `src-tauri/src/infra/benchmarks.rs`, `src-tauri/src/infra/summaries.rs`,
-  `src-tauri/src/infra/memories.rs`, `src-tauri/src/infra/sqlite.rs`, and
-  `src-tauri/src/infra/ollama.rs`.
+  `src-tauri/src/infra/memories.rs`, `src-tauri/src/infra/knowledge.rs`,
+  `src-tauri/src/infra/sqlite.rs`, and `src-tauri/src/infra/ollama.rs`.
 - `src-tauri/src/main.rs` only starts `atlas_lib::run()`.
 - Public release docs are `README.md` and `CHANGELOG.md`.
 
 There is a minimal typed frontend API wrapper for touched Ollama status, model
 lifecycle, export, jobs, database diagnostics, rich search, summaries, memory,
-and benchmark commands in `src/shared/api/tauri.ts`. There are no frontend
-feature folders, Rust `commands` module, database migrations directory,
-document indexing, or import surfaces yet.
+benchmark, and knowledge workspace commands in `src/shared/api/tauri.ts`.
+There are no frontend feature folders, Rust `commands` module, database
+migrations directory, PDF/DOCX import, embeddings, or file watcher yet.
 
 `src/App.tsx` now also owns a small frontend-only command registry and
 `Cmd/Ctrl+K` command palette. The registry uses stable command IDs and routes
@@ -66,8 +68,10 @@ Current Tauri permissions are limited to `core:default` in
 Rust owns privileged operations:
 
 - SQLite connection, schema setup, diagnostics, FTS search, benchmark storage,
-  memory storage, and queries.
+  memory storage, knowledge storage, and queries.
 - Chat and message persistence.
+- Local knowledge path validation, file discovery, file loading, chunking,
+  FTS indexing, retrieval, and source-use snapshots.
 - Ollama readiness, model list, pull, delete, and chat requests.
 - Model name validation.
 - Assistant generation cancellation state.
@@ -120,9 +124,17 @@ restore_memory(memory_id: String) -> Memory
 delete_memory(memory_id: String) -> bool
 get_memory_prompt_setting(chat_id: String) -> MemoryPromptSetting
 set_memory_prompt_enabled(chat_id: String, enabled_for_prompt: bool) -> MemoryPromptSetting
+list_knowledge_workspaces() -> Vec<KnowledgeWorkspace>
+remove_knowledge_workspace(workspace_id: String) -> bool
+list_knowledge_documents(limit: Option<i64>) -> Vec<KnowledgeDocument>
+search_knowledge_documents(query: String, limit: Option<i64>) -> Vec<DocumentSearchResult>
+get_knowledge_chunk(chunk_id: String) -> KnowledgeChunk
+get_knowledge_prompt_setting(chat_id: String) -> KnowledgePromptSetting
+set_knowledge_prompt_enabled(chat_id: String, enabled_for_prompt: bool) -> KnowledgePromptSetting
 list_model_benchmarks(limit: Option<i64>) -> Vec<ModelBenchmark>
 list_model_usage() -> Vec<ModelUsage>
 cancel_job(job_id: String) -> Job
+index_knowledge_path(path: String) -> Job
 start_model_benchmark(model: String) -> Job
 generate_assistant_response(chat_id: String, model: String) -> ChatMessage
 cancel_ollama_generation(chat_id: String) -> bool
@@ -167,6 +179,7 @@ GenerationRun
 - tokens_per_second: number | null
 - error_message: string | null
 - memory_uses: PromptMemoryUse[]
+- document_sources: GenerationDocumentSourceUse[]
 
 ChatExportFormat
 - "markdown" | "json" | "plain_text"
@@ -284,6 +297,70 @@ PromptMemoryUse
 - source_message_id: number | null
 - used_at: number
 
+KnowledgeWorkspace
+- id: string
+- name: string
+- root_path: string
+- created_at: number
+- updated_at: number
+- document_count: number
+- chunk_count: number
+- last_indexed_at: number | null
+
+KnowledgeDocument
+- id: string
+- workspace_id: string
+- path: string
+- file_name: string
+- extension: string
+- content_hash: string
+- size_bytes: number
+- modified_at: number | null
+- indexed_at: number
+- deleted_at: number | null
+- chunk_count: number
+
+KnowledgePromptSetting
+- conversation_id: string
+- enabled_for_prompt: bool
+- created_at: number
+- updated_at: number
+
+DocumentSearchResult
+- workspace_id: string
+- document_id: string
+- chunk_id: string
+- path: string
+- file_name: string
+- extension: string
+- chunk_index: number
+- start_byte: number
+- end_byte: number
+- start_line: number
+- end_line: number
+- content: string
+- snippet: string
+- score: number
+
+GenerationDocumentSourceUse
+- id: string
+- generation_run_id: string
+- retrieval_run_id: string | null
+- document_id: string | null
+- chunk_id: string | null
+- source_id: string
+- workspace_id: string | null
+- path: string
+- file_name: string
+- chunk_index: number
+- start_byte: number
+- end_byte: number
+- start_line: number
+- end_line: number
+- content: string
+- score: number
+- used_at: number
+
 ModelBenchmark
 - id: string
 - job_id: string
@@ -331,6 +408,9 @@ version 2. Chunk 9 adds `model_benchmarks` and records the current schema as
 `PRAGMA user_version = 3`. Chunk 10 adds `conversation_summaries` and records
 the current schema as `PRAGMA user_version = 4`. Chunk 11 adds transparent
 memory tables and records the current schema as `PRAGMA user_version = 5`.
+Chunk 12 adds local knowledge workspace, document, chunk, FTS, prompt setting,
+retrieval run, and generation source snapshot tables and records the current
+schema as `PRAGMA user_version = 6`.
 
 There is no migrations directory yet. Future schema changes should add
 idempotent versions after the v1 baseline instead of editing historical setup in
@@ -505,6 +585,93 @@ CREATE TABLE IF NOT EXISTS generation_memory_uses (
   source_message_id INTEGER,
   used_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS workspaces (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  root_path TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS documents (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  file_name TEXT NOT NULL,
+  extension TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  modified_at INTEGER,
+  indexed_at INTEGER NOT NULL,
+  deleted_at INTEGER,
+  UNIQUE(workspace_id, path)
+);
+
+CREATE TABLE IF NOT EXISTS document_chunks (
+  id TEXT PRIMARY KEY,
+  document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  chunk_index INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  start_byte INTEGER NOT NULL,
+  end_byte INTEGER NOT NULL,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  token_count_estimate INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(document_id, chunk_index)
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS document_chunk_search
+USING fts5(
+  content,
+  workspace_id UNINDEXED,
+  document_id UNINDEXED,
+  chunk_id UNINDEXED,
+  path UNINDEXED,
+  file_name UNINDEXED,
+  chunk_index UNINDEXED,
+  start_line UNINDEXED,
+  end_line UNINDEXED,
+  tokenize = 'unicode61'
+);
+
+CREATE TABLE IF NOT EXISTS knowledge_prompt_settings (
+  conversation_id TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+  enabled_for_prompt INTEGER NOT NULL DEFAULT 0 CHECK(enabled_for_prompt IN (0, 1)),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS retrieval_runs (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  generation_run_id TEXT REFERENCES generation_runs(id) ON DELETE SET NULL,
+  query TEXT NOT NULL,
+  strategy TEXT NOT NULL,
+  selected_chunk_ids_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS generation_document_sources (
+  id TEXT PRIMARY KEY,
+  generation_run_id TEXT NOT NULL REFERENCES generation_runs(id) ON DELETE CASCADE,
+  retrieval_run_id TEXT REFERENCES retrieval_runs(id) ON DELETE SET NULL,
+  document_id TEXT,
+  chunk_id TEXT,
+  source_id TEXT NOT NULL,
+  workspace_id TEXT,
+  path TEXT NOT NULL,
+  file_name TEXT NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  start_byte INTEGER NOT NULL,
+  end_byte INTEGER NOT NULL,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  content_snapshot TEXT NOT NULL,
+  score REAL NOT NULL,
+  used_at INTEGER NOT NULL
+);
 ```
 
 Current indexes and triggers:
@@ -555,6 +722,24 @@ CREATE INDEX IF NOT EXISTS idx_memories_source_message
 
 CREATE INDEX IF NOT EXISTS idx_generation_memory_uses_run
   ON generation_memory_uses(generation_run_id, used_at ASC);
+
+CREATE INDEX IF NOT EXISTS idx_workspaces_updated
+  ON workspaces(updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_documents_workspace_path
+  ON documents(workspace_id, path);
+
+CREATE INDEX IF NOT EXISTS idx_documents_workspace_deleted
+  ON documents(workspace_id, deleted_at, indexed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_document_chunks_document
+  ON document_chunks(document_id, chunk_index);
+
+CREATE INDEX IF NOT EXISTS idx_retrieval_runs_conversation
+  ON retrieval_runs(conversation_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_generation_document_sources_run
+  ON generation_document_sources(generation_run_id, source_id ASC);
 
 CREATE TRIGGER IF NOT EXISTS messages_after_insert_update_chat
 AFTER INSERT ON messages
@@ -609,6 +794,23 @@ Persistence behavior:
 - `generation_memory_uses` stores a snapshot of each memory included in a
   prompt for a generation run so message diagnostics can show what was used
   even if the memory is edited, archived, or forgotten later.
+- `workspaces`, `documents`, `document_chunks`, and `document_chunk_search`
+  store user-approved local text/code files. Rust canonicalizes and validates
+  roots, skips symlinks and hidden directories, indexes only `.md`, `.txt`,
+  `.json`, `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.toml`, `.yaml`, and
+  `.yml`, rejects binary/invalid UTF-8/oversized files, and never executes
+  indexed code.
+- Re-indexing uses content hashes and chunk cleanup to avoid duplicate chunks.
+  Files no longer present under an approved root are marked deleted and removed
+  from document FTS.
+- `knowledge_prompt_settings` stores the per-chat switch for using indexed
+  chunks in prompts. Missing rows behave as disabled.
+- `retrieval_runs` and `generation_document_sources` record the chunks selected
+  for a generation. Source snapshots preserve citation details even if the
+  underlying document is changed or removed later.
+- Prompt assembly adds retrieved document chunks only when knowledge is enabled
+  for the active chat. The model is instructed to cite source IDs like `[S1]`
+  and to avoid invented citations when indexed sources are insufficient.
 - During startup, queued/running/cancelling jobs from a previous process are
   marked `failed` with an interruption message so stale jobs do not remain
   cancellable forever.

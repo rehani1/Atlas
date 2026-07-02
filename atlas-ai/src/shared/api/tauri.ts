@@ -23,6 +23,7 @@ export type GenerationRun = {
   tokens_per_second: number | null
   error_message: string | null
   memory_uses: PromptMemoryUse[]
+  document_sources: GenerationDocumentSourceUse[]
 }
 
 export type ChatMessage = {
@@ -180,6 +181,88 @@ export type PromptMemoryUse = {
   used_at: number
 }
 
+export type KnowledgeWorkspace = {
+  id: string
+  name: string
+  root_path: string
+  created_at: number
+  updated_at: number
+  document_count: number
+  chunk_count: number
+  last_indexed_at: number | null
+}
+
+export type KnowledgeDocument = {
+  id: string
+  workspace_id: string
+  path: string
+  file_name: string
+  extension: string
+  content_hash: string
+  size_bytes: number
+  modified_at: number | null
+  indexed_at: number
+  deleted_at: number | null
+  chunk_count: number
+}
+
+export type KnowledgeChunk = {
+  id: string
+  document_id: string
+  chunk_index: number
+  content: string
+  start_byte: number
+  end_byte: number
+  start_line: number
+  end_line: number
+  token_count_estimate: number
+  created_at: number
+}
+
+export type KnowledgePromptSetting = {
+  conversation_id: string
+  enabled_for_prompt: boolean
+  created_at: number
+  updated_at: number
+}
+
+export type DocumentSearchResult = {
+  workspace_id: string
+  document_id: string
+  chunk_id: string
+  path: string
+  file_name: string
+  extension: string
+  chunk_index: number
+  start_byte: number
+  end_byte: number
+  start_line: number
+  end_line: number
+  content: string
+  snippet: string
+  score: number
+}
+
+export type GenerationDocumentSourceUse = {
+  id: string
+  generation_run_id: string
+  retrieval_run_id: string | null
+  document_id: string | null
+  chunk_id: string | null
+  source_id: string
+  workspace_id: string | null
+  path: string
+  file_name: string
+  chunk_index: number
+  start_byte: number
+  end_byte: number
+  start_line: number
+  end_line: number
+  content: string
+  score: number
+  used_at: number
+}
+
 export type ModelBenchmarkStatus =
   | 'queued'
   | 'running'
@@ -236,6 +319,14 @@ const commands = {
   deleteMemory: 'delete_memory',
   getMemoryPromptSetting: 'get_memory_prompt_setting',
   setMemoryPromptEnabled: 'set_memory_prompt_enabled',
+  listKnowledgeWorkspaces: 'list_knowledge_workspaces',
+  removeKnowledgeWorkspace: 'remove_knowledge_workspace',
+  listKnowledgeDocuments: 'list_knowledge_documents',
+  searchKnowledgeDocuments: 'search_knowledge_documents',
+  getKnowledgeChunk: 'get_knowledge_chunk',
+  getKnowledgePromptSetting: 'get_knowledge_prompt_setting',
+  setKnowledgePromptEnabled: 'set_knowledge_prompt_enabled',
+  indexKnowledgePath: 'index_knowledge_path',
   listModelBenchmarks: 'list_model_benchmarks',
   listModelUsage: 'list_model_usage',
   startModelBenchmark: 'start_model_benchmark',
@@ -373,6 +464,49 @@ export function setMemoryPromptEnabled(
     chatId,
     enabledForPrompt,
   })
+}
+
+export function listKnowledgeWorkspaces() {
+  return invoke<KnowledgeWorkspace[]>(commands.listKnowledgeWorkspaces)
+}
+
+export function removeKnowledgeWorkspace(workspaceId: string) {
+  return invoke<boolean>(commands.removeKnowledgeWorkspace, { workspaceId })
+}
+
+export function listKnowledgeDocuments(limit = 100) {
+  return invoke<KnowledgeDocument[]>(commands.listKnowledgeDocuments, { limit })
+}
+
+export function searchKnowledgeDocuments(query: string, limit = 20) {
+  return invoke<DocumentSearchResult[]>(commands.searchKnowledgeDocuments, {
+    query,
+    limit,
+  })
+}
+
+export function getKnowledgeChunk(chunkId: string) {
+  return invoke<KnowledgeChunk>(commands.getKnowledgeChunk, { chunkId })
+}
+
+export function getKnowledgePromptSetting(chatId: string) {
+  return invoke<KnowledgePromptSetting>(commands.getKnowledgePromptSetting, {
+    chatId,
+  })
+}
+
+export function setKnowledgePromptEnabled(
+  chatId: string,
+  enabledForPrompt: boolean,
+) {
+  return invoke<KnowledgePromptSetting>(commands.setKnowledgePromptEnabled, {
+    chatId,
+    enabledForPrompt,
+  })
+}
+
+export function indexKnowledgePath(path: string) {
+  return invoke<Job>(commands.indexKnowledgePath, { path })
 }
 
 export function listModelBenchmarks(limit = 100) {

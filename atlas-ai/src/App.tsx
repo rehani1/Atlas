@@ -19,16 +19,23 @@ import {
   generateConversationSummary,
   getConversationSummary,
   getDatabaseDiagnostics,
+  getKnowledgePromptSetting,
   getMemoryPromptSetting,
   getOllamaStatus,
+  indexKnowledgePath,
+  listKnowledgeDocuments,
+  listKnowledgeWorkspaces,
   listModelBenchmarks,
   listModelUsage,
   listJobs,
   listMemories,
+  removeKnowledgeWorkspace,
   restoreMemory,
   saveConversationSummary,
   searchConversations,
+  searchKnowledgeDocuments,
   setConversationSummaryEnabled,
+  setKnowledgePromptEnabled,
   setMemoryPromptEnabled,
   startModelBenchmark,
   updateMemory,
@@ -38,9 +45,14 @@ import {
   type ChatSearchResult,
   type ConversationSummary,
   type DatabaseDiagnostics,
+  type DocumentSearchResult,
+  type GenerationDocumentSourceUse,
   type GenerationRun,
   type Job,
   type JobEvent,
+  type KnowledgeDocument,
+  type KnowledgePromptSetting,
+  type KnowledgeWorkspace,
   type Memory,
   type MemoryPromptSetting,
   type MemoryScopeType,
@@ -67,6 +79,13 @@ type UiError = {
   details?: string
 }
 
+type SourcePreview = {
+  title: string
+  path: string
+  lineRange: string
+  content: string
+}
+
 type CommandId =
   | 'chat.new'
   | 'chat.search'
@@ -82,6 +101,7 @@ type CommandId =
   | 'settings.open'
   | 'diagnostics.open'
   | 'model_lab.open'
+  | 'knowledge.workspace.open'
   | 'knowledge.index_folder'
 
 type AppCommand = {
@@ -99,6 +119,7 @@ type CommandRegistryContext = {
   deletingChatId: string | null
   exportAction: ChatExportFormat | null
   hasActiveConversationSummaryJob: boolean
+  hasActiveKnowledgeIndexJob: boolean
   hasActiveModelBenchmarkJob: boolean
   hasActiveModelPullJob: boolean
   isDesktop: boolean
@@ -114,6 +135,7 @@ type CommandRegistryContext = {
   onOpenChatSearch: () => void
   onOpenConversationSummary: () => void
   onOpenDiagnostics: () => void
+  onOpenKnowledgeWorkspace: () => void
   onOpenMemoryInspector: () => void
   onOpenModelLab: () => void
   onOpenModelManager: () => void
@@ -280,7 +302,13 @@ function generationStatusLabel(status: GenerationRun['status']) {
   }
 }
 
-function MessageDiagnostics({ run }: { run: GenerationRun | null }) {
+function MessageDiagnostics({
+  run,
+  onOpenSource,
+}: {
+  run: GenerationRun | null
+  onOpenSource: (source: GenerationDocumentSourceUse) => void
+}) {
   if (!run) {
     return null
   }
@@ -335,6 +363,33 @@ function MessageDiagnostics({ run }: { run: GenerationRun | null }) {
                     : ''}
                 </p>
               </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+      {run.document_sources.length > 0 ? (
+        <div className="mt-3 border-t border-zinc-800/80 pt-2">
+          <p className="text-zinc-400">
+            Sources used: {run.document_sources.length}
+          </p>
+          <div className="mt-2 grid gap-1.5">
+            {run.document_sources.map((source) => (
+              <button
+                className="rounded-lg bg-zinc-950 px-2 py-1.5 text-left text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-100"
+                key={source.id}
+                type="button"
+                onClick={() => onOpenSource(source)}
+              >
+                <span className="block truncate text-zinc-300">
+                  [{source.source_id}] {source.file_name}
+                </span>
+                <span className="mt-1 block text-[11px] text-zinc-600">
+                  Lines {source.start_line}-{source.end_line}
+                </span>
+                <span className="mt-1 block break-words">
+                  {truncateText(source.content, 180)}
+                </span>
+              </button>
             ))}
           </div>
         </div>
@@ -616,6 +671,10 @@ function formatJobProgress(job: Job) {
     return `${job.progress_current} / ${job.progress_total} steps`
   }
 
+  if (job.job_type === 'document_import') {
+    return `${job.progress_current} / ${job.progress_total} files`
+  }
+
   const currentMb = job.progress_current / 1024 / 1024
   const totalMb = job.progress_total / 1024 / 1024
   return `${currentMb.toFixed(1)} / ${totalMb.toFixed(1)} MB`
@@ -792,6 +851,20 @@ function buildCommandRegistry(context: CommandRegistryContext): AppCommand[] {
     run: context.onOpenConversationSummary,
   })
 
+  commands.push({
+    id: 'knowledge.workspace.open',
+    title: 'Open Knowledge Workspace',
+    category: 'Knowledge',
+    description: context.hasActiveKnowledgeIndexJob
+      ? 'Review the active indexing job.'
+      : 'Index and search local text/code files.',
+    disabledReason: context.isDesktop
+      ? undefined
+      : 'Knowledge workspace requires the Tauri desktop app.',
+    keywords: ['rag documents files citations index folder'],
+    run: context.onOpenKnowledgeWorkspace,
+  })
+
   commands.push(
     {
       id: 'memory.inspector.open',
@@ -834,15 +907,6 @@ function buildCommandRegistry(context: CommandRegistryContext): AppCommand[] {
         : 'Model Lab requires the Tauri desktop app.',
       keywords: ['benchmark evaluate'],
       run: context.onOpenModelLab,
-    },
-    {
-      id: 'knowledge.index_folder',
-      title: 'Index folder',
-      category: 'Knowledge',
-      description: 'Add local files to the knowledge workspace.',
-      disabledReason: 'Knowledge workspace lands in Chunk 12.',
-      keywords: ['rag documents files'],
-      run: () => undefined,
     },
   )
 
@@ -1098,6 +1162,26 @@ function MemoryIcon({ className = 'h-5 w-5' }: IconProps) {
   )
 }
 
+function KnowledgeIcon({ className = 'h-5 w-5' }: IconProps) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M4 5a2 2 0 0 1 2-2h12v16H6a2 2 0 0 0-2 2Z" />
+      <path d="M8 7h6" />
+      <path d="M8 11h8" />
+      <path d="M8 15h5" />
+    </svg>
+  )
+}
+
 function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true)
   const [chats, setChats] = useState<ChatSummary[]>([])
@@ -1129,6 +1213,25 @@ function App() {
     messageId: number
     label: string
   } | null>(null)
+  const [knowledgeWorkspaces, setKnowledgeWorkspaces] = useState<
+    KnowledgeWorkspace[]
+  >([])
+  const [knowledgeDocuments, setKnowledgeDocuments] = useState<
+    KnowledgeDocument[]
+  >([])
+  const [knowledgePromptSetting, setKnowledgePromptSetting] =
+    useState<KnowledgePromptSetting | null>(null)
+  const [isKnowledgeWorkspaceOpen, setIsKnowledgeWorkspaceOpen] =
+    useState(false)
+  const [isKnowledgeLoading, setIsKnowledgeLoading] = useState(false)
+  const [knowledgeError, setKnowledgeError] = useState<string | null>(null)
+  const [knowledgeAction, setKnowledgeAction] = useState<string | null>(null)
+  const [knowledgePath, setKnowledgePath] = useState('')
+  const [knowledgeSearchQuery, setKnowledgeSearchQuery] = useState('')
+  const [knowledgeSearchResults, setKnowledgeSearchResults] = useState<
+    DocumentSearchResult[]
+  >([])
+  const [sourcePreview, setSourcePreview] = useState<SourcePreview | null>(null)
   const [draft, setDraft] = useState('')
   const [historyError, setHistoryError] = useState<string | null>(null)
   const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(() =>
@@ -1281,6 +1384,23 @@ function App() {
         ) {
           void refreshModelLabData(false)
         }
+        if (
+          event.payload.job.job_type === 'document_import' &&
+          !isActiveJob(event.payload.job)
+        ) {
+          void Promise.all([listKnowledgeWorkspaces(), listKnowledgeDocuments(100)])
+            .then(([workspaces, documents]) => {
+              if (!ignore) {
+                setKnowledgeWorkspaces(workspaces)
+                setKnowledgeDocuments(documents)
+              }
+            })
+            .catch((error: unknown) => {
+              if (!ignore) {
+                setKnowledgeError(String(error))
+              }
+            })
+        }
         const eventChatId = getJobChatId(event.payload.job)
         if (
           event.payload.job.job_type === 'conversation_summary' &&
@@ -1309,6 +1429,31 @@ function App() {
     return () => {
       ignore = true
       unlisten?.()
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!isTauriRuntime()) {
+      return
+    }
+
+    let ignore = false
+
+    Promise.all([listKnowledgeWorkspaces(), listKnowledgeDocuments(100)])
+      .then(([workspaces, documents]) => {
+        if (!ignore) {
+          setKnowledgeWorkspaces(workspaces)
+          setKnowledgeDocuments(documents)
+        }
+      })
+      .catch((error: unknown) => {
+        if (!ignore) {
+          setKnowledgeError(String(error))
+        }
+      })
+
+    return () => {
+      ignore = true
     }
   }, [])
 
@@ -1404,6 +1549,32 @@ function App() {
       .catch((error: unknown) => {
         if (!ignore && activeChatIdRef.current === chatId) {
           setMemoryError(String(error))
+        }
+      })
+
+    return () => {
+      ignore = true
+    }
+  }, [activeChatId])
+
+  useEffect(() => {
+    if (!activeChatId || !isTauriRuntime()) {
+      return
+    }
+
+    let ignore = false
+    const chatId = activeChatId
+
+    getKnowledgePromptSetting(chatId)
+      .then((setting) => {
+        if (!ignore && activeChatIdRef.current === chatId) {
+          setKnowledgePromptSetting(setting)
+          setKnowledgeError(null)
+        }
+      })
+      .catch((error: unknown) => {
+        if (!ignore && activeChatIdRef.current === chatId) {
+          setKnowledgeError(String(error))
         }
       })
 
@@ -1525,6 +1696,35 @@ function App() {
       window.clearTimeout(timeout)
     }
   }, [isChatSearchOpen, chatSearchQuery])
+
+  useEffect(() => {
+    const query = knowledgeSearchQuery.trim()
+
+    if (!isKnowledgeWorkspaceOpen || !query || !isTauriRuntime()) {
+      return
+    }
+
+    let ignore = false
+    const timeout = window.setTimeout(() => {
+      searchKnowledgeDocuments(query, 20)
+        .then((results) => {
+          if (!ignore) {
+            setKnowledgeSearchResults(results)
+            setKnowledgeError(null)
+          }
+        })
+        .catch((error: unknown) => {
+          if (!ignore) {
+            setKnowledgeError(String(error))
+          }
+        })
+    }, 180)
+
+    return () => {
+      ignore = true
+      window.clearTimeout(timeout)
+    }
+  }, [isKnowledgeWorkspaceOpen, knowledgeSearchQuery])
 
   async function refreshChats() {
     if (!isTauriRuntime()) {
@@ -1927,6 +2127,7 @@ function App() {
     setSummaryDraft('')
     setSummaryError(null)
     setMemoryPromptSetting(null)
+    setKnowledgePromptSetting(null)
     setIsExportMenuOpen(false)
     setPendingSearchJump(
       memory.source_message_id === null
@@ -1937,6 +2138,126 @@ function App() {
           },
     )
     setIsMemoryInspectorOpen(false)
+  }
+
+  async function refreshKnowledgeData(showLoading = true) {
+    if (!isTauriRuntime()) {
+      setKnowledgeError('Knowledge workspace requires the Tauri desktop app.')
+      return
+    }
+
+    try {
+      if (showLoading) {
+        setIsKnowledgeLoading(true)
+      }
+      const [workspaces, documents, setting] = await Promise.all([
+        listKnowledgeWorkspaces(),
+        listKnowledgeDocuments(100),
+        activeChatId
+          ? getKnowledgePromptSetting(activeChatId)
+          : Promise.resolve(null),
+      ])
+      setKnowledgeWorkspaces(workspaces)
+      setKnowledgeDocuments(documents)
+      setKnowledgePromptSetting(setting)
+      setKnowledgeError(null)
+    } catch (error) {
+      setKnowledgeError(String(error))
+    } finally {
+      if (showLoading) {
+        setIsKnowledgeLoading(false)
+      }
+    }
+  }
+
+  function openKnowledgeWorkspace() {
+    setIsKnowledgeWorkspaceOpen(true)
+    void refreshKnowledgeData()
+  }
+
+  async function handleIndexKnowledgePath() {
+    if (!isTauriRuntime()) {
+      setKnowledgeError('Knowledge workspace requires the Tauri desktop app.')
+      return
+    }
+
+    try {
+      setKnowledgeAction('index')
+      const job = await indexKnowledgePath(knowledgePath)
+      setJobs((currentJobs) => upsertJob(currentJobs, job))
+      setKnowledgePath('')
+      await refreshKnowledgeData(false)
+      setKnowledgeError(null)
+    } catch (error) {
+      const details = String(error)
+      if (details !== 'Job cancelled') {
+        setKnowledgeError(details)
+      }
+      await refreshKnowledgeData(false)
+    } finally {
+      setKnowledgeAction(null)
+    }
+  }
+
+  async function handleRemoveKnowledgeWorkspace(workspace: KnowledgeWorkspace) {
+    if (!isTauriRuntime()) {
+      return
+    }
+
+    try {
+      setKnowledgeAction(`remove:${workspace.id}`)
+      await removeKnowledgeWorkspace(workspace.id)
+      await refreshKnowledgeData(false)
+      setKnowledgeError(null)
+    } catch (error) {
+      setKnowledgeError(String(error))
+    } finally {
+      setKnowledgeAction(null)
+    }
+  }
+
+  async function handleSetKnowledgePromptEnabled(enabledForPrompt: boolean) {
+    if (!activeChatId || !isTauriRuntime()) {
+      setKnowledgeError(
+        activeChatId
+          ? 'Knowledge workspace requires the Tauri desktop app.'
+          : 'Open a chat before enabling knowledge.',
+      )
+      return
+    }
+
+    const chatId = activeChatId
+
+    try {
+      setKnowledgeAction('toggle-prompt')
+      const setting = await setKnowledgePromptEnabled(chatId, enabledForPrompt)
+      if (activeChatIdRef.current === chatId) {
+        setKnowledgePromptSetting(setting)
+      }
+      setKnowledgeError(null)
+    } catch (error) {
+      setKnowledgeError(String(error))
+    } finally {
+      setKnowledgeAction(null)
+    }
+  }
+
+  function openGenerationSource(source: GenerationDocumentSourceUse) {
+    setSourcePreview({
+      title: `[${source.source_id}] ${source.file_name}`,
+      path: source.path,
+      lineRange: `Lines ${source.start_line}-${source.end_line}`,
+      content: source.content,
+    })
+  }
+
+  function openSearchResultSource(result: DocumentSearchResult) {
+    setSourcePreview({
+      title: result.file_name,
+      path: result.path,
+      lineRange: `Lines ${result.start_line}-${result.end_line}`,
+      content: result.content,
+    })
   }
 
   async function refreshModelLabData(showLoading = true) {
@@ -2120,6 +2441,14 @@ function App() {
     }
   }
 
+  function handleKnowledgeSearchChange(value: string) {
+    setKnowledgeSearchQuery(value)
+
+    if (!value.trim()) {
+      setKnowledgeSearchResults([])
+    }
+  }
+
   async function handleNewChat() {
     setActiveChatId(null)
     setMessages([])
@@ -2132,6 +2461,7 @@ function App() {
     setSummaryDraft('')
     setSummaryError(null)
     setMemoryPromptSetting(null)
+    setKnowledgePromptSetting(null)
     closeChatSearch()
   }
 
@@ -2145,6 +2475,7 @@ function App() {
     setSummaryDraft('')
     setSummaryError(null)
     setMemoryPromptSetting(null)
+    setKnowledgePromptSetting(null)
     setIsExportMenuOpen(false)
     setPendingSearchJump(null)
     closeChatSearch()
@@ -2156,6 +2487,7 @@ function App() {
     setSummaryDraft('')
     setSummaryError(null)
     setMemoryPromptSetting(null)
+    setKnowledgePromptSetting(null)
     setIsExportMenuOpen(false)
     setPendingSearchJump(
       result.message_id === null
@@ -2309,6 +2641,7 @@ function App() {
       setSummaryDraft('')
       setSummaryError(null)
       setMemoryPromptSetting(null)
+      setKnowledgePromptSetting(null)
       setHistoryError(null)
 
       if (respondingChatId === chatId) {
@@ -2386,6 +2719,12 @@ function App() {
   const activeConversationSummaryProgress = activeConversationSummaryJob
     ? getJobProgressPercent(activeConversationSummaryJob)
     : null
+  const activeKnowledgeIndexJob = jobs.find(
+    (job) => job.job_type === 'document_import' && isActiveJob(job),
+  )
+  const activeKnowledgeIndexProgress = activeKnowledgeIndexJob
+    ? getJobProgressPercent(activeKnowledgeIndexJob)
+    : null
   const activePromptMemories =
     activeChatId && memoryPromptSetting?.enabled_for_prompt
       ? memories.filter(
@@ -2396,6 +2735,10 @@ function App() {
                 memory.scope_id === activeChatId)),
         )
       : []
+  const indexedKnowledgeDocumentCount = knowledgeWorkspaces.reduce(
+    (sum, workspace) => sum + workspace.document_count,
+    0,
+  )
   const modelUsageByName = new Map(
     modelUsage.map((usage) => [usage.model_name, usage]),
   )
@@ -2427,6 +2770,7 @@ function App() {
     deletingChatId,
     exportAction,
     hasActiveConversationSummaryJob: activeConversationSummaryJob !== undefined,
+    hasActiveKnowledgeIndexJob: activeKnowledgeIndexJob !== undefined,
     hasActiveModelBenchmarkJob: activeModelBenchmarkJob !== undefined,
     hasActiveModelPullJob: activeModelPullJob !== undefined,
     isDesktop: isTauriRuntime(),
@@ -2442,6 +2786,7 @@ function App() {
     onOpenChatSearch: openChatSearch,
     onOpenConversationSummary: openConversationSummary,
     onOpenDiagnostics: openDiagnostics,
+    onOpenKnowledgeWorkspace: openKnowledgeWorkspace,
     onOpenMemoryInspector: openMemoryInspector,
     onOpenModelLab: openModelLab,
     onOpenModelManager: openModelManager,
@@ -2692,6 +3037,23 @@ function App() {
           <div className="absolute top-4 right-4 z-10 flex items-start gap-2">
             <button
               className={`grid h-10 w-10 place-items-center rounded-xl border shadow-[0_12px_36px_rgba(0,0,0,0.35)] transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                knowledgePromptSetting?.enabled_for_prompt
+                  ? 'border-zinc-500 bg-zinc-100 text-zinc-950 hover:bg-white'
+                  : 'border-zinc-800 bg-black/90 text-zinc-300 hover:bg-zinc-950 hover:text-zinc-100'
+              }`}
+              type="button"
+              aria-label={
+                knowledgePromptSetting?.enabled_for_prompt
+                  ? 'Open Knowledge Workspace, knowledge use enabled'
+                  : 'Open Knowledge Workspace'
+              }
+              onClick={openKnowledgeWorkspace}
+            >
+              <KnowledgeIcon />
+            </button>
+
+            <button
+              className={`grid h-10 w-10 place-items-center rounded-xl border shadow-[0_12px_36px_rgba(0,0,0,0.35)] transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
                 memoryPromptSetting?.enabled_for_prompt
                   ? 'border-zinc-500 bg-zinc-100 text-zinc-950 hover:bg-white'
                   : 'border-zinc-800 bg-black/90 text-zinc-300 hover:bg-zinc-950 hover:text-zinc-100'
@@ -2768,6 +3130,19 @@ function App() {
               onClick={handleDeleteActiveChat}
             >
               <TrashIcon />
+            </button>
+          </div>
+        ) : null}
+
+        {!activeChatId ? (
+          <div className="absolute top-4 right-4 z-10">
+            <button
+              className="grid h-10 w-10 place-items-center rounded-xl border border-zinc-800 bg-black/90 text-zinc-300 shadow-[0_12px_36px_rgba(0,0,0,0.35)] transition-colors hover:bg-zinc-950 hover:text-zinc-100"
+              type="button"
+              aria-label="Open Knowledge Workspace"
+              onClick={openKnowledgeWorkspace}
+            >
+              <KnowledgeIcon />
             </button>
           </div>
         ) : null}
@@ -3044,6 +3419,30 @@ function App() {
               </section>
             ) : null}
 
+            {knowledgePromptSetting?.enabled_for_prompt ? (
+              <section className="mr-auto flex max-w-[min(100%,34rem)] flex-wrap items-center justify-between gap-3 rounded-2xl border border-zinc-800 bg-zinc-950 px-4 py-3 text-sm text-zinc-200">
+                <div className="min-w-0">
+                  <p className="font-medium text-zinc-100">
+                    Knowledge context on
+                  </p>
+                  <p className="mt-1 text-xs text-zinc-500">
+                    {`${indexedKnowledgeDocumentCount} indexed ${
+                      indexedKnowledgeDocumentCount === 1
+                        ? 'document'
+                        : 'documents'
+                    }`}
+                  </p>
+                </div>
+                <button
+                  className="rounded-lg border border-zinc-700 px-2.5 py-1 text-xs font-medium text-zinc-200 transition-colors hover:bg-zinc-900"
+                  type="button"
+                  onClick={openKnowledgeWorkspace}
+                >
+                  Inspect
+                </button>
+              </section>
+            ) : null}
+
             {messages.map((message) => (
               <article
                 className={`max-w-[78%] overflow-hidden rounded-2xl px-4 py-3 text-sm leading-6 break-words transition-[box-shadow,outline-color] ${
@@ -3082,7 +3481,10 @@ function App() {
                   </div>
                 ) : null}
                 {message.role === 'assistant' ? (
-                  <MessageDiagnostics run={message.generation_run} />
+                  <MessageDiagnostics
+                    run={message.generation_run}
+                    onOpenSource={openGenerationSource}
+                  />
                 ) : null}
               </article>
             ))}
@@ -3642,6 +4044,313 @@ function App() {
                 </div>
               </section>
             </div>
+          </section>
+        </div>
+      ) : null}
+
+      {isKnowledgeWorkspaceOpen ? (
+        <div
+          className="fixed inset-0 z-50 bg-black/70 px-4 py-[6vh]"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setIsKnowledgeWorkspaceOpen(false)
+            }
+          }}
+        >
+          <section
+            className="mx-auto flex max-h-[88vh] w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-950 shadow-[0_24px_80px_rgba(0,0,0,0.55)]"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Knowledge Workspace"
+          >
+            <header className="flex items-start justify-between gap-4 border-b border-zinc-800 px-4 py-3">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-zinc-100">
+                  Knowledge Workspace
+                </p>
+                <p className="mt-0.5 text-xs text-zinc-500">
+                  {`${knowledgeWorkspaces.length} ${
+                    knowledgeWorkspaces.length === 1 ? 'workspace' : 'workspaces'
+                  } - ${indexedKnowledgeDocumentCount} indexed ${
+                    indexedKnowledgeDocumentCount === 1 ? 'document' : 'documents'
+                  }`}
+                </p>
+              </div>
+              <div className="flex flex-none items-center gap-2">
+                <button
+                  className="h-8 rounded-lg border border-zinc-800 px-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+                  type="button"
+                  disabled={isKnowledgeLoading}
+                  onClick={() => void refreshKnowledgeData()}
+                >
+                  {isKnowledgeLoading ? 'Loading' : 'Refresh'}
+                </button>
+                <button
+                  className="grid h-8 w-8 place-items-center rounded-lg border-0 bg-transparent text-zinc-500 transition-colors hover:bg-zinc-900 hover:text-zinc-100"
+                  type="button"
+                  aria-label="Close Knowledge Workspace"
+                  onClick={() => setIsKnowledgeWorkspaceOpen(false)}
+                >
+                  <XIcon />
+                </button>
+              </div>
+            </header>
+
+            <div className="grid gap-4 overflow-y-auto p-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.25fr)]">
+              <section className="min-w-0">
+                {knowledgeError ? (
+                  <p className="mb-3 rounded-xl border border-red-900/60 bg-red-950/30 px-3 py-2 text-sm text-red-200">
+                    {knowledgeError}
+                  </p>
+                ) : null}
+
+                <label className="flex items-center justify-between gap-3 rounded-xl border border-zinc-800 bg-zinc-900/50 px-3 py-2 text-sm text-zinc-200">
+                  <span className="min-w-0">
+                    <span className="block font-medium text-zinc-100">
+                      Use knowledge in this chat
+                    </span>
+                    <span className="mt-0.5 block text-xs text-zinc-500">
+                      {activeChatId
+                        ? knowledgePromptSetting?.enabled_for_prompt
+                          ? 'Enabled'
+                          : 'Disabled'
+                        : 'No active chat'}
+                    </span>
+                  </span>
+                  <input
+                    className="h-5 w-5 flex-none accent-zinc-100"
+                    type="checkbox"
+                    checked={knowledgePromptSetting?.enabled_for_prompt ?? false}
+                    disabled={!activeChatId || knowledgeAction === 'toggle-prompt'}
+                    onChange={(event) =>
+                      void handleSetKnowledgePromptEnabled(event.target.checked)
+                    }
+                  />
+                </label>
+
+                {activeKnowledgeIndexJob ? (
+                  <div className="mt-4 rounded-xl border border-zinc-800 bg-zinc-900/60 px-3 py-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-medium text-zinc-100">
+                          {activeKnowledgeIndexJob.label}
+                        </p>
+                        <p className="mt-0.5 text-xs text-zinc-500">
+                          {formatJobProgress(activeKnowledgeIndexJob)}
+                        </p>
+                      </div>
+                      <button
+                        className="rounded-lg border border-zinc-700 px-2.5 py-1 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+                        type="button"
+                        disabled={activeKnowledgeIndexJob.status === 'cancelling'}
+                        onClick={() => handleCancelJob(activeKnowledgeIndexJob.id)}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                    {activeKnowledgeIndexProgress !== null ? (
+                      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-zinc-950">
+                        <div
+                          className="h-full rounded-full bg-zinc-100 transition-[width]"
+                          style={{ width: `${activeKnowledgeIndexProgress}%` }}
+                        />
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                <div className="mt-4 rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
+                  <label
+                    className="block text-xs font-semibold tracking-[0.08em] text-zinc-500 uppercase"
+                    htmlFor="knowledge-path"
+                  >
+                    Path
+                  </label>
+                  <div className="mt-2 flex gap-2">
+                    <input
+                      className="h-10 min-w-0 flex-1 rounded-lg border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none transition-colors placeholder:text-zinc-600 focus:border-zinc-600"
+                      id="knowledge-path"
+                      type="text"
+                      placeholder="/Users/rehanislam/project"
+                      value={knowledgePath}
+                      onChange={(event) => setKnowledgePath(event.target.value)}
+                    />
+                    <button
+                      className="h-10 rounded-lg bg-zinc-100 px-3 text-sm font-semibold text-zinc-950 transition-colors hover:bg-white disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500"
+                      type="button"
+                      disabled={
+                        !knowledgePath.trim() ||
+                        knowledgeAction !== null ||
+                        activeKnowledgeIndexJob !== undefined
+                      }
+                      onClick={handleIndexKnowledgePath}
+                    >
+                      {knowledgeAction === 'index' ? 'Indexing' : 'Index'}
+                    </button>
+                  </div>
+                </div>
+
+                <section className="mt-4 min-w-0">
+                  <p className="mb-2 text-xs font-semibold tracking-[0.08em] text-zinc-500 uppercase">
+                    Indexed Workspaces
+                  </p>
+                  <div className="grid gap-2">
+                    {knowledgeWorkspaces.length > 0 ? (
+                      knowledgeWorkspaces.map((workspace) => (
+                        <div
+                          className="rounded-xl border border-zinc-800 bg-zinc-900/70 px-3 py-2"
+                          key={workspace.id}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <p className="truncate text-sm font-medium text-zinc-100">
+                                {workspace.name}
+                              </p>
+                              <p className="mt-1 truncate text-xs text-zinc-500">
+                                {workspace.root_path}
+                              </p>
+                              <p className="mt-1 text-xs text-zinc-500">
+                                {workspace.document_count} docs -{' '}
+                                {workspace.chunk_count} chunks
+                              </p>
+                            </div>
+                            <button
+                              className="rounded-lg border border-red-950/80 px-2 py-1 text-xs font-medium text-red-300 transition-colors hover:bg-red-950/30 disabled:cursor-not-allowed disabled:opacity-50"
+                              type="button"
+                              disabled={knowledgeAction !== null}
+                              onClick={() =>
+                                handleRemoveKnowledgeWorkspace(workspace)
+                              }
+                            >
+                              {knowledgeAction === `remove:${workspace.id}`
+                                ? 'Removing'
+                                : 'Remove'}
+                            </button>
+                          </div>
+                        </div>
+                      ))
+                    ) : (
+                      <p className="rounded-xl bg-zinc-900/70 px-3 py-2 text-sm text-zinc-500">
+                        No indexed workspaces.
+                      </p>
+                    )}
+                  </div>
+                </section>
+              </section>
+
+              <section className="min-w-0">
+                <label
+                  className="mb-2 block text-xs font-semibold tracking-[0.08em] text-zinc-500 uppercase"
+                  htmlFor="knowledge-search"
+                >
+                  Search
+                </label>
+                <input
+                  className="h-10 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none transition-colors placeholder:text-zinc-600 focus:border-zinc-600"
+                  id="knowledge-search"
+                  type="search"
+                  placeholder="Search indexed files"
+                  value={knowledgeSearchQuery}
+                  onChange={(event) =>
+                    handleKnowledgeSearchChange(event.target.value)
+                  }
+                />
+
+                <div className="mt-3 grid gap-2">
+                  {knowledgeSearchQuery.trim() ? (
+                    knowledgeSearchResults.length > 0 ? (
+                      knowledgeSearchResults.map((result) => (
+                        <button
+                          className="rounded-xl border border-zinc-800 bg-zinc-900/70 px-3 py-2 text-left transition-colors hover:bg-zinc-900"
+                          key={result.chunk_id}
+                          type="button"
+                          onClick={() => openSearchResultSource(result)}
+                        >
+                          <span className="block truncate text-sm font-medium text-zinc-100">
+                            {result.file_name}
+                          </span>
+                          <span className="mt-1 block text-xs text-zinc-500">
+                            Lines {result.start_line}-{result.end_line}
+                          </span>
+                          <span className="mt-1 block max-h-12 overflow-hidden text-xs leading-5 text-zinc-400">
+                            {result.snippet}
+                          </span>
+                        </button>
+                      ))
+                    ) : (
+                      <p className="rounded-xl bg-zinc-900/70 px-3 py-2 text-sm text-zinc-500">
+                        No matching chunks.
+                      </p>
+                    )
+                  ) : knowledgeDocuments.length > 0 ? (
+                    knowledgeDocuments.map((document) => (
+                      <div
+                        className="rounded-xl border border-zinc-800 bg-zinc-900/70 px-3 py-2"
+                        key={document.id}
+                      >
+                        <p className="truncate text-sm font-medium text-zinc-100">
+                          {document.file_name}
+                        </p>
+                        <p className="mt-1 truncate text-xs text-zinc-500">
+                          {document.path}
+                        </p>
+                        <p className="mt-1 text-xs text-zinc-500">
+                          {document.chunk_count} chunks -{' '}
+                          {formatBytes(document.size_bytes)}
+                        </p>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="rounded-xl bg-zinc-900/70 px-3 py-2 text-sm text-zinc-500">
+                      No indexed documents.
+                    </p>
+                  )}
+                </div>
+              </section>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {sourcePreview ? (
+        <div
+          className="fixed inset-0 z-[60] bg-black/70 px-4 py-[8vh]"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setSourcePreview(null)
+            }
+          }}
+        >
+          <section
+            className="mx-auto flex max-h-[84vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-950 shadow-[0_24px_80px_rgba(0,0,0,0.55)]"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Source chunk"
+          >
+            <header className="flex items-start justify-between gap-4 border-b border-zinc-800 px-4 py-3">
+              <div className="min-w-0">
+                <p className="truncate text-sm font-semibold text-zinc-100">
+                  {sourcePreview.title}
+                </p>
+                <p className="mt-0.5 truncate text-xs text-zinc-500">
+                  {sourcePreview.path}
+                </p>
+                <p className="mt-0.5 text-xs text-zinc-500">
+                  {sourcePreview.lineRange}
+                </p>
+              </div>
+              <button
+                className="grid h-8 w-8 place-items-center rounded-lg border-0 bg-transparent text-zinc-500 transition-colors hover:bg-zinc-900 hover:text-zinc-100"
+                type="button"
+                aria-label="Close source chunk"
+                onClick={() => setSourcePreview(null)}
+              >
+                <XIcon />
+              </button>
+            </header>
+            <pre className="overflow-auto p-4 text-sm leading-6 whitespace-pre-wrap text-zinc-200">
+              {sourcePreview.content}
+            </pre>
           </section>
         </div>
       ) : null}
