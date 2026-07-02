@@ -5,7 +5,7 @@ mod infra;
 use app::{
     benchmarks as benchmark_service, context as context_service, jobs as job_service,
     knowledge as knowledge_service, memories as memory_service, models as model_service,
-    summaries as summary_service,
+    summaries as summary_service, tools as tool_service,
 };
 use domain::benchmark::{ModelBenchmark, ModelUsage};
 use domain::context::GenerationContextItem;
@@ -19,9 +19,11 @@ use domain::memory::{Memory, MemoryPromptSetting, MemoryScopeType, PromptMemoryU
 use domain::model::{validate_ollama_model_name, OllamaModel, OllamaStatus};
 use domain::search::ChatSearchResult;
 use domain::summary::{ConversationSummary, SummarySourceMessage};
+use domain::tools::{ToolCall, ToolPermissionDecision};
 use infra::{
     benchmarks::CompletedBenchmarkMetrics, context as context_repository, jobs as job_repository,
     knowledge as knowledge_repository, memories as memory_repository, ollama, search, sqlite,
+    tools as tool_repository,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
@@ -80,6 +82,7 @@ struct ChatMessage {
     content: String,
     created_at: i64,
     generation_run: Option<GenerationRun>,
+    tool_calls: Vec<ToolCall>,
 }
 
 #[derive(Clone, Serialize)]
@@ -1387,6 +1390,7 @@ fn read_chat_message(row: &Row<'_>) -> Result<ChatMessage, rusqlite::Error> {
         content: row.get(3)?,
         created_at: row.get(4)?,
         generation_run: None,
+        tool_calls: Vec::new(),
     })
 }
 
@@ -1430,6 +1434,7 @@ fn read_chat_message_with_generation_run(row: &Row<'_>) -> Result<ChatMessage, r
         content: row.get(3)?,
         created_at: row.get(4)?,
         generation_run: read_generation_run(row, 5)?,
+        tool_calls: Vec::new(),
     })
 }
 
@@ -1654,6 +1659,7 @@ fn list_messages_for_chat(
         .collect::<Result<Vec<_>, _>>()?;
 
     for message in &mut messages {
+        message.tool_calls = tool_repository::list_for_message(conn, message.id)?;
         if let Some(run) = &mut message.generation_run {
             run.memory_uses = memory_repository::list_generation_uses(conn, &run.id)?;
             run.document_sources =
@@ -2261,6 +2267,19 @@ fn set_knowledge_prompt_enabled(
         .map_err(|_| "Database lock was poisoned".to_string())?;
     require_chat(&conn, &chat_id)?;
     knowledge_service::set_prompt_enabled(&conn, &chat_id, enabled_for_prompt, now_millis()?)
+}
+
+#[tauri::command]
+fn resolve_tool_call(
+    store: State<'_, ChatStore>,
+    tool_call_id: String,
+    decision: ToolPermissionDecision,
+) -> Result<ToolCall, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    tool_service::resolve_tool_call(&conn, &tool_call_id, decision, now_millis()?)
 }
 
 #[tauri::command]
@@ -3081,7 +3100,15 @@ async fn generate_assistant_response(
                 .conn
                 .lock()
                 .map_err(|_| "Database lock was poisoned".to_string())?;
-            let mut message = insert_message(&conn, &chat_id, "assistant", &result.content)?;
+            let visible_content = tool_service::visible_assistant_content(&result.content);
+            let mut message = insert_message(&conn, &chat_id, "assistant", &visible_content)?;
+            message.tool_calls = tool_service::record_pending_from_model_output(
+                &conn,
+                &chat_id,
+                message.id,
+                &result.content,
+                completion.completed_at,
+            )?;
             let mut run = update_generation_run(&conn, &run_id, Some(message.id), &completion)?;
             run.memory_uses = memory_uses;
             run.document_sources = document_sources;
@@ -3121,7 +3148,8 @@ async fn generate_assistant_response(
                 return Err(error.message);
             }
 
-            let mut message = match insert_message(&conn, &chat_id, "assistant", &error.content) {
+            let visible_content = tool_service::visible_assistant_content(&error.content);
+            let mut message = match insert_message(&conn, &chat_id, "assistant", &visible_content) {
                 Ok(message) => message,
                 Err(insert_error) => {
                     if error.cancelled {
@@ -3131,6 +3159,13 @@ async fn generate_assistant_response(
                     return Err(insert_error);
                 }
             };
+            message.tool_calls = tool_service::record_pending_from_model_output(
+                &conn,
+                &chat_id,
+                message.id,
+                &error.content,
+                completion.completed_at,
+            )?;
             let run = match update_generation_run(&conn, &run_id, Some(message.id), &completion) {
                 Ok(mut run) => {
                     run.memory_uses = memory_uses;
@@ -3210,6 +3245,7 @@ pub fn run() {
             get_knowledge_chunk,
             get_knowledge_prompt_setting,
             set_knowledge_prompt_enabled,
+            resolve_tool_call,
             add_message,
             delete_chat,
             export_chat,
@@ -3244,6 +3280,7 @@ mod tests {
     use super::app::{
         benchmarks as benchmark_service, context as context_service, jobs as job_service,
         knowledge as knowledge_service, memories as memory_service, summaries as summary_service,
+        tools as tool_service,
     };
     use super::domain::benchmark::ModelBenchmarkStatus;
     use super::domain::job::{JobStatus, JobType};
@@ -3252,10 +3289,11 @@ mod tests {
         build_ollama_status, validate_ollama_model_name, OllamaModel, OllamaStatusKind,
     };
     use super::domain::search::SearchResultSource;
+    use super::domain::tools::ToolPermissionDecision;
     use super::infra::{
         benchmarks::{self as benchmark_repository, CompletedBenchmarkMetrics},
         context as context_repository, jobs as job_repository, knowledge as knowledge_repository,
-        memories as memory_repository, search, sqlite,
+        memories as memory_repository, search, sqlite, tools as tool_repository,
     };
     use super::{
         calculate_tokens_per_second, create_generation_run, escape_like_pattern,
@@ -3373,6 +3411,7 @@ mod tests {
                 content: "Summarize this.".to_string(),
                 created_at: 0,
                 generation_run: None,
+                tool_calls: Vec::new(),
             },
             ChatMessage {
                 id: 2,
@@ -3401,6 +3440,7 @@ mod tests {
                     document_sources: Vec::new(),
                     context_items: Vec::new(),
                 }),
+                tool_calls: Vec::new(),
             },
         ];
 
@@ -3692,6 +3732,7 @@ mod tests {
                 content: "Earlier question".to_string(),
                 created_at: 125,
                 generation_run: None,
+                tool_calls: Vec::new(),
             },
             ChatMessage {
                 id: 2,
@@ -3700,6 +3741,7 @@ mod tests {
                 content: "Earlier answer".to_string(),
                 created_at: 150,
                 generation_run: None,
+                tool_calls: Vec::new(),
             },
             ChatMessage {
                 id: 3,
@@ -3708,6 +3750,7 @@ mod tests {
                 content: "What context was used?".to_string(),
                 created_at: 175,
                 generation_run: None,
+                tool_calls: Vec::new(),
             },
         ];
         let run_id = create_generation_run(&conn, "chat-1", "llama3.2:3b", 200).unwrap();
@@ -3739,6 +3782,96 @@ mod tests {
         assert!(listed_items
             .windows(2)
             .all(|items| items[0].order_index <= items[1].order_index));
+    }
+
+    #[test]
+    fn tool_service_logs_denies_and_executes_safe_calls() {
+        let conn = Connection::open_in_memory().unwrap();
+        sqlite::setup_database(&conn).unwrap();
+        conn.execute(
+            "
+            INSERT INTO chats (id, title, created_at, updated_at)
+            VALUES ('chat-1', 'Tool Check', 100, 100)
+            ",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "
+            INSERT INTO messages (id, chat_id, role, content, created_at)
+            VALUES (1, 'chat-1', 'assistant', 'Requested Atlas tool: search_index', 125)
+            ",
+            [],
+        )
+        .unwrap();
+
+        let pending_calls = tool_service::record_pending_from_model_output(
+            &conn,
+            "chat-1",
+            1,
+            r#"{"atlas_tool_call":{"tool_name":"search_index","arguments":{"query":"SQLite WAL"}}}"#,
+            150,
+        )
+        .unwrap();
+        assert_eq!(pending_calls.len(), 1);
+        assert_eq!(pending_calls[0].status.as_str(), "pending");
+        assert_eq!(pending_calls[0].arguments_summary, "query: \"SQLite WAL\"");
+
+        let denied = tool_service::resolve_tool_call(
+            &conn,
+            &pending_calls[0].id,
+            ToolPermissionDecision::Deny,
+            175,
+        )
+        .unwrap();
+        assert_eq!(denied.status.as_str(), "denied");
+
+        let executable = tool_service::record_pending_from_model_output(
+            &conn,
+            "chat-1",
+            1,
+            r#"{"tool_name":"search_index","arguments":{"query":"not indexed yet"}}"#,
+            200,
+        )
+        .unwrap();
+        let succeeded = tool_service::resolve_tool_call(
+            &conn,
+            &executable[0].id,
+            ToolPermissionDecision::AllowOnce,
+            225,
+        )
+        .unwrap();
+        assert_eq!(succeeded.status.as_str(), "succeeded");
+        assert!(succeeded
+            .result_summary
+            .as_deref()
+            .unwrap()
+            .contains("No indexed chunks matched"));
+
+        let unsupported = tool_service::record_pending_from_model_output(
+            &conn,
+            "chat-1",
+            1,
+            r#"{"tool_name":"create_note","arguments":{"title":"x","content":"private body"}}"#,
+            250,
+        )
+        .unwrap();
+        let failed = tool_service::resolve_tool_call(
+            &conn,
+            &unsupported[0].id,
+            ToolPermissionDecision::AllowOnce,
+            275,
+        )
+        .unwrap();
+        assert_eq!(failed.status.as_str(), "failed");
+        assert!(failed
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("not enabled"));
+
+        let listed_calls = tool_repository::list_for_message(&conn, 1).unwrap();
+        assert_eq!(listed_calls.len(), 3);
     }
 
     #[test]
@@ -3866,7 +3999,7 @@ mod tests {
         sqlite::setup_database(&conn).unwrap();
         let diagnostics = sqlite::diagnostics(&conn, &db_path).unwrap();
 
-        assert_eq!(diagnostics.user_version, 7);
+        assert_eq!(diagnostics.user_version, 8);
         assert_eq!(diagnostics.journal_mode, "wal");
         assert_eq!(diagnostics.integrity_check, "ok");
         assert!(diagnostics
@@ -3922,6 +4055,14 @@ mod tests {
         assert!(diagnostics.table_counts.iter().any(|table| {
             table.table_name == "generation_context_items" && table.row_count == 0
         }));
+        assert!(diagnostics
+            .table_counts
+            .iter()
+            .any(|table| table.table_name == "tool_calls" && table.row_count == 0));
+        assert!(diagnostics
+            .table_counts
+            .iter()
+            .any(|table| table.table_name == "tool_permissions" && table.row_count == 0));
 
         drop(conn);
         let _ = fs::remove_file(&db_path);

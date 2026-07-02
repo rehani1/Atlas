@@ -15,7 +15,8 @@ Tailwind CSS, SQLite, and Ollama. The current codebase is intentionally compact:
   cancellation still live in `src-tauri/src/lib.rs`.
 - Backend service slices now include model management, jobs, database
   setup/diagnostics, FTS search, model benchmarks, summaries, memories, and
-  local knowledge indexing, and generation context assembly:
+  local knowledge indexing, generation context assembly, and permissioned local
+  tool calls:
   `src-tauri/src/domain/model.rs`, `src-tauri/src/app/models.rs`,
   `src-tauri/src/domain/job.rs`, `src-tauri/src/app/jobs.rs`,
   `src-tauri/src/domain/benchmark.rs`, `src-tauri/src/app/benchmarks.rs`,
@@ -23,18 +24,20 @@ Tailwind CSS, SQLite, and Ollama. The current codebase is intentionally compact:
   `src-tauri/src/domain/memory.rs`, `src-tauri/src/app/memories.rs`,
   `src-tauri/src/domain/knowledge.rs`, `src-tauri/src/app/knowledge.rs`,
   `src-tauri/src/domain/context.rs`, `src-tauri/src/app/context.rs`,
+  `src-tauri/src/domain/tools.rs`, `src-tauri/src/app/tools.rs`,
   `src-tauri/src/infra/jobs.rs`, `src-tauri/src/domain/database.rs`,
   `src-tauri/src/domain/search.rs`, `src-tauri/src/infra/search.rs`,
   `src-tauri/src/infra/benchmarks.rs`, `src-tauri/src/infra/summaries.rs`,
   `src-tauri/src/infra/memories.rs`, `src-tauri/src/infra/knowledge.rs`,
-  `src-tauri/src/infra/context.rs`, `src-tauri/src/infra/sqlite.rs`, and
-  `src-tauri/src/infra/ollama.rs`.
+  `src-tauri/src/infra/context.rs`, `src-tauri/src/infra/tools.rs`,
+  `src-tauri/src/infra/sqlite.rs`, and `src-tauri/src/infra/ollama.rs`.
 - `src-tauri/src/main.rs` only starts `atlas_lib::run()`.
 - Public release docs are `README.md` and `CHANGELOG.md`.
 
 There is a minimal typed frontend API wrapper for touched Ollama status, model
 lifecycle, export, jobs, database diagnostics, rich search, summaries, memory,
-benchmark, and knowledge workspace commands in `src/shared/api/tauri.ts`.
+benchmark, knowledge workspace, and local tool-call commands in
+`src/shared/api/tauri.ts`.
 There are no frontend feature folders, Rust `commands` module, database
 migrations directory, PDF/DOCX import, embeddings, or file watcher yet.
 
@@ -77,6 +80,8 @@ Rust owns privileged operations:
 - Ollama readiness, model list, pull, delete, and chat requests.
 - Model name validation.
 - Assistant generation cancellation state.
+- Local tool-call parsing, permission decisions, audit logging, and execution of
+  the safe read-limited tool subset.
 - Tauri app setup and app-data directory creation.
 
 React owns UI and interaction state:
@@ -139,6 +144,7 @@ cancel_job(job_id: String) -> Job
 index_knowledge_path(path: String) -> Job
 start_model_benchmark(model: String) -> Job
 generate_assistant_response(chat_id: String, model: String) -> ChatMessage
+resolve_tool_call(tool_call_id: String, decision: ToolPermissionDecision) -> ToolCall
 cancel_ollama_generation(chat_id: String) -> bool
 ```
 
@@ -162,6 +168,7 @@ ChatMessage
 - content: string
 - created_at: number
 - generation_run: GenerationRun | null
+- tool_calls: ToolCall[]
 
 GenerationRun
 - id: string
@@ -395,6 +402,25 @@ ModelBenchmark
 - error_message: string | null
 - created_at: number
 
+ToolCallStatus
+- "pending" | "denied" | "succeeded" | "failed"
+
+ToolPermissionDecision
+- "allow_once" | "always_allow_workspace" | "deny"
+
+ToolCall
+- id: string
+- conversation_id: string
+- message_id: number | null
+- tool_name: string
+- arguments_json: string
+- arguments_summary: string
+- status: ToolCallStatus
+- result_summary: string | null
+- error_message: string | null
+- created_at: number
+- completed_at: number | null
+
 ModelUsage
 - model_name: string
 - last_used_at: number | null
@@ -425,7 +451,9 @@ memory tables and records the current schema as `PRAGMA user_version = 5`.
 Chunk 12 adds local knowledge workspace, document, chunk, FTS, prompt setting,
 retrieval run, and generation source snapshot tables and records the current
 schema as `PRAGMA user_version = 6`. Chunk 13 adds generation context item
-metadata and records the current schema as `PRAGMA user_version = 7`.
+metadata and records the current schema as `PRAGMA user_version = 7`. Chunk 14
+adds tool-call audit and permission tables and records the current schema as
+`PRAGMA user_version = 8`.
 
 There is no migrations directory yet. Future schema changes should add
 idempotent versions after the v1 baseline instead of editing historical setup in
@@ -708,6 +736,31 @@ CREATE TABLE IF NOT EXISTS generation_context_items (
   metadata_json TEXT,
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS tool_calls (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+  tool_name TEXT NOT NULL,
+  arguments_json TEXT NOT NULL,
+  arguments_summary TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending', 'denied', 'succeeded', 'failed')),
+  result_summary TEXT,
+  error_message TEXT,
+  created_at INTEGER NOT NULL,
+  completed_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS tool_permissions (
+  id TEXT PRIMARY KEY,
+  scope_type TEXT NOT NULL CHECK(scope_type IN ('workspace')),
+  scope_id TEXT NOT NULL,
+  tool_name TEXT NOT NULL,
+  permission TEXT NOT NULL CHECK(permission IN ('allow')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(scope_type, scope_id, tool_name)
+);
 ```
 
 Current indexes and triggers:
@@ -779,6 +832,18 @@ CREATE INDEX IF NOT EXISTS idx_generation_document_sources_run
 
 CREATE INDEX IF NOT EXISTS idx_generation_context_items_run
   ON generation_context_items(generation_run_id, order_index ASC);
+
+CREATE INDEX IF NOT EXISTS idx_tool_calls_conversation
+  ON tool_calls(conversation_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_tool_calls_message
+  ON tool_calls(message_id, created_at ASC);
+
+CREATE INDEX IF NOT EXISTS idx_tool_calls_status
+  ON tool_calls(status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_tool_permissions_scope
+  ON tool_permissions(scope_type, scope_id, tool_name);
 
 CREATE TRIGGER IF NOT EXISTS messages_after_insert_update_chat
 AFTER INSERT ON messages
@@ -860,6 +925,18 @@ Persistence behavior:
   user message, and model options. Older prior messages are omitted when needed
   to stay under a conservative token estimate, and truncation is recorded as an
   explicit context item.
+- `tool_calls` stores model-requested Atlas tool calls with conversation/message
+  linkage, normalized tool name, redacted/log-safe argument JSON, argument
+  summary, status, result summary, readable error message, and timestamps.
+- `tool_permissions` stores explicit workspace-scoped allow preferences. The
+  MVP still requires a visible pending request before execution and does not add
+  arbitrary shell access or broad filesystem approval.
+- The enabled local tool execution subset is safe and read-limited:
+  `search_index(query)`, `read_file_chunk(chunk_id)`, and
+  `get_model_stats(model_name)`. `search_index` and `read_file_chunk` only read
+  already-indexed Atlas knowledge data; `read_file_chunk` records chunk metadata
+  and content length, not the full chunk body, in the tool-call log. Unsupported
+  requested tools fail with an understandable status message.
 - During startup, queued/running/cancelling jobs from a previous process are
   marked `failed` with an interruption message so stale jobs do not remain
   cancellable forever.
@@ -870,8 +947,8 @@ Persistence behavior:
 - `get_database_diagnostics` reads the database path, database/WAL/SHM sizes,
   journal mode, schema user version, page counts, free pages, integrity check,
   and table counts for core tables, FTS tables, benchmark tables, summary
-  tables, memory tables, knowledge tables, and context item tables. It does not
-  export chat content or mutate user data.
+  tables, memory tables, knowledge tables, context item tables, and tool-call
+  tables. It does not export chat content or mutate user data.
 
 ## Chat Generation Flow
 
@@ -922,13 +999,37 @@ The backend generation path:
    `prompt_eval_duration`, `eval_count`, and `eval_duration`.
 14. Converts Ollama nanosecond durations into rounded milliseconds and calculates
    tokens/sec from `eval_count / eval_duration`.
-15. Inserts an assistant message and associates it with the generation run when
-    final or partial assistant text exists.
-16. Finalizes the generation run as `completed`, `cancelled`, or `failed`.
+15. Converts a pure tool-call JSON response into visible assistant text before
+    persisting it, then inserts an assistant message and associates it with the
+    generation run when final or partial assistant text exists.
+16. Records any parsed Atlas tool request as a pending `tool_calls` row attached
+    to the assistant message.
+17. Finalizes the generation run as `completed`, `cancelled`, or `failed`.
 
 Important current limitation: chat is streamed from Ollama to Rust, but not
 token-streamed from Rust to React. React shows animated progress dots while
 waiting and receives one final `ChatMessage` after completion.
+
+## Local Tool Calling Flow
+
+Local tool calling is permissioned and backend-owned:
+
+- The system prompt tells compatible local models to request tools only by
+  returning a single JSON object. The accepted forms are
+  `{"atlas_tool_call": {"tool_name": "...", "arguments": {...}}}` and
+  `{"tool_name": "...", "arguments": {...}}`.
+- Rust parses model output in `app::tools`, normalizes the tool name, creates a
+  user-visible assistant message such as `Requested Atlas tool: ...`, and logs a
+  pending `tool_calls` row. Regular JSON without a tool name is ignored.
+- The chat UI renders `message.tool_calls` below the assistant message. Pending
+  calls expose `Allow once`, `Always allow for this workspace`, and `Deny`.
+- `resolve_tool_call(tool_call_id, decision)` is the only execution path. Deny
+  marks the call `denied`; allow decisions execute in Rust and mark the call
+  `succeeded` or `failed` with a concise result or readable error.
+- Executed tools cannot run shell commands. The enabled subset reads only Atlas
+  data already approved through local indexing or internal model metrics.
+- Tool-call logs store argument summaries and redacted/log-safe argument JSON.
+  Result summaries avoid storing full private file/chunk content.
 
 ## Conversation Summary Flow
 
@@ -1107,6 +1208,7 @@ Current limitations:
 - Sidebar open/closed state.
 - Chat summaries and active chat ID.
 - Current chat messages.
+- Pending tool-call action state for visible per-message tool permission cards.
 - Active conversation summary, editable summary draft, summary panel visibility,
   summary loading/action state, and summary errors.
 - Memory list, active chat memory prompt setting, Memory Inspector visibility,
@@ -1181,6 +1283,12 @@ manual create/edit form, and a visible per-chat memory-use switch. Message rows
 include a user-triggered `Remember` action that creates source-linked memory
 only when the user confirms the form.
 
+Assistant messages can render tool-call cards when `message.tool_calls` is
+non-empty. The cards show tool name, argument summary, status, result/error
+summary, and permission buttons for pending calls. Permission buttons call the
+typed `resolveToolCall()` wrapper and update only the matching tool call in
+local message state.
+
 The sidebar search uses `search_conversations` in the Tauri desktop app. Results
 show conversation title, result source, date, message count, and snippet parts
 with highlighted matches. Selecting a message result opens the conversation,
@@ -1232,6 +1340,8 @@ Current user-visible error surfaces:
 - Per-message generation details for assistant messages with associated
   `generation_run` metadata, including memory snapshots when memories were
   included in the prompt.
+- Per-message tool-call cards for pending, denied, succeeded, and failed local
+  tool requests. Resolution failures are surfaced through `historyError`.
 
 Ollama connection failures are normalized to:
 
@@ -1256,11 +1366,11 @@ The frontend suppresses that cancellation message in the active chat error UI.
   and `infra` boundaries. SQLite setup/diagnostics and search have `domain` and
   `infra` modules. Chat, export, and generation are still mostly in `lib.rs`.
 - The frontend still calls many chat `invoke()` commands directly from
-  `src/App.tsx`; touched model, export, jobs, diagnostics, and rich search
-  commands have typed wrappers.
+  `src/App.tsx`; touched model, export, jobs, diagnostics, rich search, and
+  tool-call commands have typed wrappers.
 - The command registry is centralized in `src/App.tsx`, but it is still coupled
   to local component state and handlers until frontend feature modules exist.
-- Schema setup records current user version 7, but there is not yet an
+- Schema setup records current user version 8, but there is not yet an
   incremental migrations directory for future versions.
 - The SQLite connection is protected by one mutex, so long database work would
   block other database operations.
@@ -1273,6 +1383,8 @@ The frontend suppresses that cancellation message in the active chat error UI.
 - Cancellation depends on checking a flag between blocking stream reads.
 - Failed runs with no assistant text are persisted but only surface as inline
   `historyError` in the current UI.
+- Tool-call execution is intentionally narrow and does not yet support the full
+  future tool list beyond the safe read-limited subset.
 - Model delete still has no progress or cancellation path.
 - `search_chats` remains `LIKE`-based for compatibility, while the primary
   sidebar search now uses FTS5.
@@ -1308,6 +1420,17 @@ Chunk 11 adds the persistent `memories`, `memory_prompt_settings`, and
 `generation_memory_uses` tables, manual Memory Inspector CRUD, per-chat memory
 prompt toggles, explicit source-message memory creation, and memory-use
 snapshots in assistant message diagnostics.
+Chunk 12 adds local knowledge workspaces, validated text/code file indexing,
+document chunks, document FTS search, per-chat knowledge prompt toggles,
+retrieval run/source snapshots, and source previews in message diagnostics.
+Chunk 13 adds the explicit context assembly service, ordered
+`generation_context_items`, prompt composition metadata, and visible diagnostics
+for summaries, memories, source chunks, selected prior messages, model options,
+and intentional truncation.
+Chunk 14 adds permissioned local tool-call parsing, `tool_calls` and
+`tool_permissions`, the `resolve_tool_call` command, visible per-message
+tool-call cards, deny/allow decisions, and read-limited Rust execution for
+`search_index`, `read_file_chunk`, and `get_model_stats`.
 
 Relevant checks:
 

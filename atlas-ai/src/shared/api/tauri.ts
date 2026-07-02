@@ -34,6 +34,7 @@ export type ChatMessage = {
   content: string
   created_at: number
   generation_run: GenerationRun | null
+  tool_calls: ToolCall[]
 }
 
 export type OllamaStatusKind =
@@ -286,6 +287,27 @@ export type GenerationContextItem = {
   created_at: number
 }
 
+export type ToolCallStatus = 'pending' | 'denied' | 'succeeded' | 'failed'
+
+export type ToolPermissionDecision =
+  | 'allow_once'
+  | 'always_allow_workspace'
+  | 'deny'
+
+export type ToolCall = {
+  id: string
+  conversation_id: string
+  message_id: number | null
+  tool_name: string
+  arguments_json: string
+  arguments_summary: string
+  status: ToolCallStatus
+  result_summary: string | null
+  error_message: string | null
+  created_at: number
+  completed_at: number | null
+}
+
 export type ModelBenchmarkStatus =
   | 'queued'
   | 'running'
@@ -350,6 +372,7 @@ const commands = {
   getKnowledgePromptSetting: 'get_knowledge_prompt_setting',
   setKnowledgePromptEnabled: 'set_knowledge_prompt_enabled',
   indexKnowledgePath: 'index_knowledge_path',
+  resolveToolCall: 'resolve_tool_call',
   listModelBenchmarks: 'list_model_benchmarks',
   listModelUsage: 'list_model_usage',
   startModelBenchmark: 'start_model_benchmark',
@@ -530,6 +553,13 @@ export function setKnowledgePromptEnabled(
 
 export function indexKnowledgePath(path: string) {
   return invoke<Job>(commands.indexKnowledgePath, { path })
+}
+
+export function resolveToolCall(
+  toolCallId: string,
+  decision: ToolPermissionDecision,
+) {
+  return invoke<ToolCall>(commands.resolveToolCall, { toolCallId, decision })
 }
 
 export function listModelBenchmarks(limit = 100) {

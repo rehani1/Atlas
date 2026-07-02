@@ -31,6 +31,7 @@ import {
   listMemories,
   removeKnowledgeWorkspace,
   restoreMemory,
+  resolveToolCall,
   saveConversationSummary,
   searchConversations,
   searchKnowledgeDocuments,
@@ -61,6 +62,8 @@ import {
   type ModelUsage,
   type OllamaModel,
   type OllamaStatus,
+  type ToolCall,
+  type ToolPermissionDecision,
 } from './shared/api/tauri'
 
 type IconProps = {
@@ -159,6 +162,11 @@ const chatExportFormats: { format: ChatExportFormat; label: string }[] = [
   { format: 'markdown', label: 'Markdown' },
   { format: 'json', label: 'JSON' },
   { format: 'plain_text', label: 'Plain text' },
+]
+const toolPermissionDecisions: ToolPermissionDecision[] = [
+  'allow_once',
+  'always_allow_workspace',
+  'deny',
 ]
 const browserOllamaStatus: OllamaStatus = {
   status: 'unavailable',
@@ -513,6 +521,79 @@ function MessageDiagnostics({
   )
 }
 
+function ToolCallCard({
+  toolCall,
+  activeAction,
+  onResolve,
+}: {
+  toolCall: ToolCall
+  activeAction: string | null
+  onResolve: (toolCall: ToolCall, decision: ToolPermissionDecision) => void
+}) {
+  const isPending = toolCall.status === 'pending'
+  const isWorking = activeAction?.startsWith(`${toolCall.id}:`) ?? false
+
+  return (
+    <div className="mt-3 rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-zinc-400">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="font-medium text-zinc-100">
+            Tool request: {toolCall.tool_name}
+          </p>
+          <p className="mt-1 break-words text-zinc-500">
+            {toolCall.arguments_summary}
+          </p>
+        </div>
+        <span
+          className={`rounded-lg px-2 py-1 text-[11px] font-medium ${
+            toolCall.status === 'failed'
+              ? 'bg-red-950/50 text-red-200'
+              : toolCall.status === 'succeeded'
+                ? 'bg-emerald-950/40 text-emerald-200'
+                : 'bg-zinc-900 text-zinc-400'
+          }`}
+        >
+          {toolCallStatusLabel(toolCall.status)}
+        </span>
+      </div>
+
+      {toolCall.result_summary ? (
+        <p className="mt-2 break-words text-zinc-300">
+          {toolCall.result_summary}
+        </p>
+      ) : null}
+
+      {toolCall.error_message ? (
+        <p className="mt-2 break-words text-red-200/90">
+          {toolCall.error_message}
+        </p>
+      ) : null}
+
+      {isPending ? (
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          {toolPermissionDecisions.map((decision) => (
+            <button
+              className={`max-w-full rounded-lg border px-2 py-1 text-left text-xs font-medium whitespace-normal transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                decision === 'deny'
+                  ? 'border-red-950/80 text-red-300 hover:bg-red-950/30'
+                  : 'border-zinc-700 text-zinc-300 hover:bg-zinc-900'
+              }`}
+              key={decision}
+              type="button"
+              disabled={activeAction !== null}
+              onClick={() => onResolve(toolCall, decision)}
+            >
+              {isWorking && activeAction === `${toolCall.id}:${decision}`
+                ? 'Working'
+                : toolDecisionLabel(decision)}
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 function buildOllamaStatusFromModels(
   models: OllamaModel[],
   selectedModel?: string,
@@ -758,6 +839,30 @@ function jobStatusLabel(status: Job['status']) {
       return 'Succeeded'
     case 'failed':
       return 'Failed'
+  }
+}
+
+function toolCallStatusLabel(status: ToolCall['status']) {
+  switch (status) {
+    case 'pending':
+      return 'Pending'
+    case 'denied':
+      return 'Denied'
+    case 'succeeded':
+      return 'Succeeded'
+    case 'failed':
+      return 'Failed'
+  }
+}
+
+function toolDecisionLabel(decision: ToolPermissionDecision) {
+  switch (decision) {
+    case 'allow_once':
+      return 'Allow once'
+    case 'always_allow_workspace':
+      return 'Always allow for this workspace'
+    case 'deny':
+      return 'Deny'
   }
 }
 
@@ -1349,6 +1454,7 @@ function App() {
   const [sourcePreview, setSourcePreview] = useState<SourcePreview | null>(null)
   const [draft, setDraft] = useState('')
   const [historyError, setHistoryError] = useState<string | null>(null)
+  const [toolAction, setToolAction] = useState<string | null>(null)
   const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(() =>
     isTauriRuntime() ? null : browserOllamaStatus,
   )
@@ -2621,6 +2727,35 @@ function App() {
     setHistoryError(null)
   }
 
+  async function handleResolveToolCall(
+    toolCall: ToolCall,
+    decision: ToolPermissionDecision,
+  ) {
+    if (!isTauriRuntime()) {
+      return
+    }
+
+    try {
+      setToolAction(`${toolCall.id}:${decision}`)
+      const updatedToolCall = await resolveToolCall(toolCall.id, decision)
+      setMessages((currentMessages) =>
+        currentMessages.map((message) => ({
+          ...message,
+          tool_calls: message.tool_calls.map((currentToolCall) =>
+            currentToolCall.id === updatedToolCall.id
+              ? updatedToolCall
+              : currentToolCall,
+          ),
+        })),
+      )
+      setHistoryError(null)
+    } catch (error) {
+      setHistoryError(String(error))
+    } finally {
+      setToolAction(null)
+    }
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
 
@@ -2641,6 +2776,7 @@ function App() {
         content,
         created_at: Date.now(),
         generation_run: null,
+        tool_calls: [],
       }
       setMessages((currentMessages) => [...currentMessages, message])
       setDraft('')
@@ -3593,6 +3729,18 @@ function App() {
                     >
                       Remember
                     </button>
+                  </div>
+                ) : null}
+                {message.tool_calls.length > 0 ? (
+                  <div className="mt-3 grid gap-2">
+                    {message.tool_calls.map((toolCall) => (
+                      <ToolCallCard
+                        key={toolCall.id}
+                        toolCall={toolCall}
+                        activeAction={toolAction}
+                        onResolve={handleResolveToolCall}
+                      />
+                    ))}
                   </div>
                 ) : null}
                 {message.role === 'assistant' ? (

@@ -7,3 +7,4 @@ pub(crate) mod ollama;
 pub(crate) mod search;
 pub(crate) mod sqlite;
 pub(crate) mod summaries;
+pub(crate) mod tools;

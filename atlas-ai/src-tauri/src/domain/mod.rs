@@ -7,3 +7,4 @@ pub(crate) mod memory;
 pub(crate) mod model;
 pub(crate) mod search;
 pub(crate) mod summary;
+pub(crate) mod tools;

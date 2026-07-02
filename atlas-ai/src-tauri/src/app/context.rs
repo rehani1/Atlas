@@ -17,7 +17,7 @@ use crate::{
 const MAX_CONTEXT_TOKEN_ESTIMATE: i64 = 12_000;
 const PRIOR_MESSAGE_RESERVE_TOKENS: i64 = 1_000;
 const PREVIEW_CHARS: usize = 180;
-const SYSTEM_PROMPT: &str = "You are Atlas, a private local AI workspace. Answer directly from the visible conversation and explicitly provided context. Do not claim access to files, memory, or summaries unless those sources are provided in this prompt. Do not reveal hidden chain-of-thought.";
+const SYSTEM_PROMPT: &str = "You are Atlas, a private local AI workspace. Answer directly from the visible conversation and explicitly provided context. Do not claim access to files, memory, or summaries unless those sources are provided in this prompt. Do not reveal hidden chain-of-thought. If you need an Atlas tool, request it instead of pretending it ran. Tool requests must be a single JSON object and no other text: {\"atlas_tool_call\":{\"tool_name\":\"search_index\",\"arguments\":{\"query\":\"search terms\"}}}. Available read-limited tools are search_index(query), read_file_chunk(chunk_id), and get_model_stats(model_name). Atlas will ask the user before executing any tool.";
 const NO_KNOWLEDGE_SOURCES_CONTEXT: &str = "The user enabled Atlas local knowledge for this chat, but no matching indexed source chunks were retrieved for this message. Do not invent file citations; if the answer depends on local files, say the indexed sources do not contain enough information.";
 
 pub(crate) struct AssemblyInput<'a> {
@@ -548,6 +548,7 @@ mod tests {
             content: content.to_string(),
             created_at: id,
             generation_run: None,
+            tool_calls: Vec::new(),
         }
     }
 
