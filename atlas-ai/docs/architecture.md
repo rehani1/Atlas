@@ -104,6 +104,11 @@ download_ollama_model(model: String) -> Job
 delete_ollama_model(model: String) -> Vec<OllamaModel>
 list_jobs(limit: Option<i64>) -> Vec<Job>
 get_database_diagnostics() -> DatabaseDiagnostics
+get_conversation_summary(chat_id: String) -> Option<ConversationSummary>
+save_conversation_summary(chat_id: String, summary: String, enabled_for_prompt: bool) -> ConversationSummary
+set_conversation_summary_enabled(chat_id: String, enabled_for_prompt: bool) -> ConversationSummary
+delete_conversation_summary(chat_id: String) -> bool
+generate_conversation_summary(chat_id: String, model: String) -> ConversationSummary
 list_model_benchmarks(limit: Option<i64>) -> Vec<ModelBenchmark>
 list_model_usage() -> Vec<ModelUsage>
 cancel_job(job_id: String) -> Job
@@ -222,6 +227,18 @@ ChatSearchResult
 - score: number
 - snippet: SearchSnippetPart[]
 
+ConversationSummary
+- id: string
+- conversation_id: string
+- summary: string
+- source_message_start_id: number | null
+- source_message_end_id: number | null
+- model_name: string
+- version: number
+- enabled_for_prompt: bool
+- created_at: number
+- updated_at: number
+
 ModelBenchmark
 - id: string
 - job_id: string
@@ -266,7 +283,8 @@ connection and runs repeatable baseline schema setup. The current
 `chats`/`messages`/`generation_runs`/`jobs` schema is treated as baseline
 version 1. Chunk 8 adds FTS search tables and records the current schema as
 version 2. Chunk 9 adds `model_benchmarks` and records the current schema as
-`PRAGMA user_version = 3`.
+`PRAGMA user_version = 3`. Chunk 10 adds `conversation_summaries` and records
+the current schema as `PRAGMA user_version = 4`.
 
 There is no migrations directory yet. Future schema changes should add
 idempotent versions after the v1 baseline instead of editing historical setup in
@@ -395,6 +413,19 @@ CREATE TABLE IF NOT EXISTS model_benchmarks (
   error_message TEXT,
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS conversation_summaries (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL UNIQUE REFERENCES chats(id) ON DELETE CASCADE,
+  summary TEXT NOT NULL,
+  source_message_start_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+  source_message_end_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+  model_name TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  enabled_for_prompt INTEGER NOT NULL DEFAULT 0 CHECK(enabled_for_prompt IN (0, 1)),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 ```
 
 Current indexes and triggers:
@@ -427,6 +458,12 @@ CREATE INDEX IF NOT EXISTS idx_model_benchmarks_job
 
 CREATE INDEX IF NOT EXISTS idx_model_benchmarks_created
   ON model_benchmarks(created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_summaries_updated
+  ON conversation_summaries(updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_summaries_enabled
+  ON conversation_summaries(conversation_id, enabled_for_prompt);
 
 CREATE TRIGGER IF NOT EXISTS messages_after_insert_update_chat
 AFTER INSERT ON messages
@@ -468,6 +505,10 @@ Persistence behavior:
   job, including prompt hash, status, total duration, first-token latency,
   prompt/eval token counts, durations, completion tokens/sec, and readable
   failure/cancellation messages.
+- `conversation_summaries` stores one current summary per chat, the source
+  message ID range, model name, monotonically increasing version, and an
+  explicit `enabled_for_prompt` flag. New generated summaries default to prompt
+  use off unless the user had already enabled the existing summary.
 - During startup, queued/running/cancelling jobs from a previous process are
   marked `failed` with an interruption message so stale jobs do not remain
   cancellable forever.
@@ -477,8 +518,8 @@ Persistence behavior:
 - WAL mode is enabled for the file-backed desktop database.
 - `get_database_diagnostics` reads the database path, database/WAL/SHM sizes,
   journal mode, schema user version, page counts, free pages, integrity check,
-  and table counts for core tables, FTS tables, and benchmark tables. It does
-  not export chat content or mutate user data.
+  and table counts for core tables, FTS tables, benchmark tables, and summary
+  tables. It does not export chat content or mutate user data.
 
 ## Chat Generation Flow
 
@@ -493,32 +534,66 @@ The user flow starts in `src/App.tsx`:
 5. `add_message` persists the user message.
 6. The frontend refreshes chat summaries.
 7. `generate_assistant_response` is called with `chatId` and `model`.
-8. When the command resolves, the frontend appends the assistant message only if
+8. If the active conversation summary exists and `enabled_for_prompt` is true,
+   the backend prepends it as an explicit system context block before the
+   visible chat messages.
+9. When the command resolves, the frontend appends the assistant message only if
    the active chat still matches the generating chat.
-9. The frontend reloads messages and refreshes chat summaries.
+10. The frontend reloads messages and refreshes chat summaries.
 
 The backend generation path:
 
 1. Validates the model name.
 2. Loads all messages for the chat from SQLite.
-3. Converts them to Ollama chat messages.
-4. Creates a `generation_runs` row with status `running`.
-5. Registers a cancellation flag in `GenerationTasks` keyed by `chat_id`.
-6. Runs blocking Ollama streaming work on Tauri's blocking runtime.
-7. Calls `POST http://127.0.0.1:11434/api/chat` with `stream: true`.
-8. Reads Ollama JSONL chunks, accumulates `message.content`, tracks first
+3. Loads the enabled conversation summary, if the user has turned prompt use on
+   for this chat.
+4. Converts the optional summary and all visible messages to Ollama chat
+   messages. The summary is inserted as a system message that states it was
+   user-enabled and transparent.
+5. Creates a `generation_runs` row with status `running`.
+6. Registers a cancellation flag in `GenerationTasks` keyed by `chat_id`.
+7. Runs blocking Ollama streaming work on Tauri's blocking runtime.
+8. Calls `POST http://127.0.0.1:11434/api/chat` with `stream: true`.
+9. Reads Ollama JSONL chunks, accumulates `message.content`, tracks first
    non-empty token time, and captures optional final Ollama metadata:
    `total_duration`, `load_duration`, `prompt_eval_count`,
    `prompt_eval_duration`, `eval_count`, and `eval_duration`.
-9. Converts Ollama nanosecond durations into rounded milliseconds and calculates
+10. Converts Ollama nanosecond durations into rounded milliseconds and calculates
    tokens/sec from `eval_count / eval_duration`.
-10. Inserts an assistant message and associates it with the generation run when
+11. Inserts an assistant message and associates it with the generation run when
     final or partial assistant text exists.
-11. Finalizes the generation run as `completed`, `cancelled`, or `failed`.
+12. Finalizes the generation run as `completed`, `cancelled`, or `failed`.
 
 Important current limitation: chat is streamed from Ollama to Rust, but not
 token-streamed from Rust to React. React shows animated progress dots while
 waiting and receives one final `ChatMessage` after completion.
+
+## Conversation Summary Flow
+
+Conversation summaries are manual and per-chat:
+
+- `get_conversation_summary(chat_id)` returns the current summary row, if one
+  exists.
+- `save_conversation_summary(chat_id, summary, enabled_for_prompt)` saves user
+  edits, stores the current message source range, sets `model_name` to
+  `manual`, and preserves the explicit prompt-use choice supplied by the UI.
+- `generate_conversation_summary(chat_id, model)` creates a
+  `conversation_summary` job, validates that the selected model is installed,
+  sends the visible chat transcript to Ollama with a summary-specific prompt,
+  and saves the generated summary with the source message range and model name.
+- `set_conversation_summary_enabled(chat_id, enabled_for_prompt)` toggles
+  whether the summary is included in future chat prompts for that conversation.
+- `delete_conversation_summary(chat_id)` removes the summary and disables any
+  future prompt use for that chat.
+
+Generated summaries are cancellable through `cancel_job(job_id)`. Cancellation
+does not persist partial summary text. Failures leave the previous summary, if
+any, unchanged and are shown through the job surface and summary panel.
+
+Prompt use is off by default for a newly generated summary. If the user had
+already enabled a previous summary for that chat, generating an update preserves
+that setting. When enabled, the chat screen shows a visible "Summary context on"
+state and the summary action button is highlighted.
 
 ## Cancellation Flow
 
@@ -641,6 +716,8 @@ Current limitations:
 - Sidebar open/closed state.
 - Chat summaries and active chat ID.
 - Current chat messages.
+- Active conversation summary, editable summary draft, summary panel visibility,
+  summary loading/action state, and summary errors.
 - Composer draft.
 - Chat/history errors.
 - Optional assistant-message generation run details.
@@ -667,6 +744,8 @@ Existing stale-state guards:
 - Job event handling upserts jobs by `job_id`, so stale events cannot overwrite
   unrelated jobs.
 - Model benchmark terminal job events refresh Model Lab history and usage.
+- Conversation summary terminal job events refresh the active chat summary only
+  when the job payload `chat_id` still matches the open chat.
 - `activeChatIdRef` guards against appending/reloading assistant messages into a
   chat that is no longer active.
 - Search result jumps are scoped by `chat_id` and `message_id`, so selecting a
@@ -681,8 +760,9 @@ The command palette opens with `Cmd/Ctrl+K`, focuses its search field, supports
 arrow/enter keyboard selection, and closes on escape or backdrop click. Initial
 enabled commands call existing handlers for new chat, chat search, model manager
 open, model refresh, model selection, recommended model downloads, database
-diagnostics, Model Lab, and active chat deletion when valid. It also exposes
-active-chat export commands for Markdown, JSON, and plain text. Future surfaces
+diagnostics, Model Lab, chat summaries, and active chat deletion when valid. It
+also exposes active-chat export commands for Markdown, JSON, and plain text.
+Future surfaces
 such as settings and folder indexing are represented as disabled commands with
 visible reasons instead of placeholder business logic.
 
@@ -691,6 +771,12 @@ It shows installed models, last chat usage from `generation_runs`, benchmark
 history from `model_benchmarks`, an active benchmark progress/cancel surface,
 and the fastest measured local model by completion tokens/sec only. It does not
 claim quality rankings or auto-download models.
+
+The Conversation Summary panel is reachable from the active chat action group
+and command palette. It shows the current summary, source message range, model,
+version, updated time, a prompt-use toggle, manual edit/save/delete actions, and
+a job-backed generate/update action. The active chat shows an explicit summary
+context indicator when prompt use is enabled.
 
 The sidebar search uses `search_conversations` in the Tauri desktop app. Results
 show conversation title, result source, date, message count, and snippet parts
@@ -710,8 +796,9 @@ capability has been added.
 
 The job status surface shows active jobs and failed jobs. Model pull jobs show
 progress bytes when Ollama reports totals. Model benchmark jobs show fixed-suite
-prompt progress. Both surfaces show readable errors and a cancel action that
-calls `cancel_job(job_id)`.
+prompt progress. Conversation summary jobs show one-step summary progress. These
+surfaces show readable errors and a cancel action that calls
+`cancel_job(job_id)`.
 
 The first-run readiness surface handles:
 
@@ -731,6 +818,8 @@ Current user-visible error surfaces:
   export, and database errors.
 - `modelError` for model refresh, download, and delete errors, with expandable
   technical details where available.
+- `summaryError` for summary loading, generation, editing, prompt-use toggling,
+  and deletion failures.
 - `chatSearchError` for search-specific failures.
 - `databaseDiagnosticsError` for database diagnostics loading failures.
 - Readiness notices for Ollama offline, no local models, selected model missing,
@@ -771,8 +860,9 @@ The frontend suppresses that cancellation message in the active chat error UI.
   block other database operations.
 - Database diagnostics are a focused modal, not the full diagnostics center
   planned for later chunks.
-- Chat generation sends the full conversation every time; there is no prompt
-  assembly layer or context diagnostics.
+- Chat generation still sends the full conversation every time. The only prompt
+  assembly behavior today is the optional user-enabled summary system context;
+  there is no broader context diagnostics surface yet.
 - The generation task registry is in-memory and keyed only by chat ID.
 - Cancellation depends on checking a flag between blocking stream reads.
 - Failed runs with no assistant text are persisted but only surface as inline
@@ -805,6 +895,9 @@ Chunk 9 adds the persistent `model_benchmarks` table, benchmark service and
 job-backed runner, `start_model_benchmark`, `list_model_benchmarks`,
 `list_model_usage`, and a Model Lab modal for installed models, measured speed,
 latency, history, and cancellation.
+Chunk 10 adds the persistent `conversation_summaries` table, manual summary
+save/edit/delete/toggle commands, a cancellable `conversation_summary` job,
+optional user-visible prompt inclusion, and a Conversation Summary panel.
 
 Relevant checks:
 

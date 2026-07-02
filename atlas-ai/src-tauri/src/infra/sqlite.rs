@@ -3,10 +3,10 @@ use std::{fs, path::Path, time::Duration};
 
 use crate::{
     domain::database::{DatabaseDiagnostics, DatabaseTableCount},
-    infra::{benchmarks, jobs, search},
+    infra::{benchmarks, jobs, search, summaries},
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 pub(crate) fn setup_database(conn: &Connection) -> Result<(), rusqlite::Error> {
     configure_connection(conn)?;
@@ -14,6 +14,7 @@ pub(crate) fn setup_database(conn: &Connection) -> Result<(), rusqlite::Error> {
     jobs::create_schema(conn)?;
     search::create_schema(conn)?;
     benchmarks::create_schema(conn)?;
+    summaries::create_schema(conn)?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
 
     Ok(())
@@ -101,6 +102,7 @@ pub(crate) fn diagnostics(
         "chat_search",
         "message_search",
         "model_benchmarks",
+        "conversation_summaries",
     ]
     .into_iter()
     .map(|table_name| table_count(conn, table_name))

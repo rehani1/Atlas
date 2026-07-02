@@ -131,6 +131,19 @@ export type ChatSearchResult = {
   snippet: SearchSnippetPart[]
 }
 
+export type ConversationSummary = {
+  id: string
+  conversation_id: string
+  summary: string
+  source_message_start_id: number | null
+  source_message_end_id: number | null
+  model_name: string
+  version: number
+  enabled_for_prompt: boolean
+  created_at: number
+  updated_at: number
+}
+
 export type ModelBenchmarkStatus =
   | 'queued'
   | 'running'
@@ -174,6 +187,11 @@ const commands = {
   cancelJob: 'cancel_job',
   getDatabaseDiagnostics: 'get_database_diagnostics',
   searchConversations: 'search_conversations',
+  getConversationSummary: 'get_conversation_summary',
+  saveConversationSummary: 'save_conversation_summary',
+  setConversationSummaryEnabled: 'set_conversation_summary_enabled',
+  deleteConversationSummary: 'delete_conversation_summary',
+  generateConversationSummary: 'generate_conversation_summary',
   listModelBenchmarks: 'list_model_benchmarks',
   listModelUsage: 'list_model_usage',
   startModelBenchmark: 'start_model_benchmark',
@@ -213,6 +231,45 @@ export function searchConversations(query: string, limit = 30) {
   return invoke<ChatSearchResult[]>(commands.searchConversations, {
     query,
     limit,
+  })
+}
+
+export function getConversationSummary(chatId: string) {
+  return invoke<ConversationSummary | null>(commands.getConversationSummary, {
+    chatId,
+  })
+}
+
+export function saveConversationSummary(
+  chatId: string,
+  summary: string,
+  enabledForPrompt: boolean,
+) {
+  return invoke<ConversationSummary>(commands.saveConversationSummary, {
+    chatId,
+    summary,
+    enabledForPrompt,
+  })
+}
+
+export function setConversationSummaryEnabled(
+  chatId: string,
+  enabledForPrompt: boolean,
+) {
+  return invoke<ConversationSummary>(commands.setConversationSummaryEnabled, {
+    chatId,
+    enabledForPrompt,
+  })
+}
+
+export function deleteConversationSummary(chatId: string) {
+  return invoke<boolean>(commands.deleteConversationSummary, { chatId })
+}
+
+export function generateConversationSummary(chatId: string, model: string) {
+  return invoke<ConversationSummary>(commands.generateConversationSummary, {
+    chatId,
+    model,
   })
 }
 

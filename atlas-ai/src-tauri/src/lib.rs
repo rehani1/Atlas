@@ -2,12 +2,16 @@ mod app;
 mod domain;
 mod infra;
 
-use app::{benchmarks as benchmark_service, jobs as job_service, models as model_service};
+use app::{
+    benchmarks as benchmark_service, jobs as job_service, models as model_service,
+    summaries as summary_service,
+};
 use domain::benchmark::{ModelBenchmark, ModelUsage};
 use domain::database::DatabaseDiagnostics;
 use domain::job::{Job, JobEvent, JobStatus, JobType};
 use domain::model::{validate_ollama_model_name, OllamaModel, OllamaStatus};
 use domain::search::ChatSearchResult;
+use domain::summary::{ConversationSummary, SummarySourceMessage};
 use infra::{
     benchmarks::CompletedBenchmarkMetrics, jobs as job_repository, ollama, search, sqlite,
 };
@@ -44,6 +48,11 @@ struct JobTasks {
 #[derive(Default)]
 struct BenchmarkTasks {
     active_job_id: Mutex<Option<String>>,
+}
+
+#[derive(Default)]
+struct SummaryTasks {
+    active_by_chat_id: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Serialize)]
@@ -520,6 +529,269 @@ fn run_model_benchmark_job(
     };
     emit_job_event(&app, &final_job)?;
     Ok(final_job)
+}
+
+struct ConversationSummaryJobInput {
+    chat_id: String,
+    chat_title: String,
+    model: String,
+    messages: Vec<SummarySourceMessage>,
+    preserve_enabled_for_prompt: Option<bool>,
+}
+
+struct ConversationSummaryJobOutput {
+    job: Job,
+    summary: Option<ConversationSummary>,
+}
+
+fn build_summary_prompt_messages(messages: &[SummarySourceMessage]) -> Vec<OllamaChatMessage> {
+    let mut transcript = String::new();
+
+    for message in messages {
+        transcript.push_str(&format!(
+            "[message:{} role:{}]\n{}\n\n",
+            message.id, message.role, message.content
+        ));
+    }
+
+    vec![
+        OllamaChatMessage {
+            role: "system".to_string(),
+            content: [
+                "You write concise conversation summaries for Atlas, a private local AI workspace.",
+                "Use only the provided transcript.",
+                "Return Markdown with exactly these headings: Current topic, Key decisions, User preferences, Open questions, Important constraints.",
+                "Write \"None noted\" for empty sections.",
+                "Do not invent hidden memory or facts from outside this chat.",
+            ]
+            .join(" "),
+        },
+        OllamaChatMessage {
+            role: "user".to_string(),
+            content: format!(
+                "Summarize this conversation for future continuity.\n\nTranscript:\n\n{transcript}"
+            ),
+        },
+    ]
+}
+
+fn summary_prompt_context(summary: &ConversationSummary) -> OllamaChatMessage {
+    OllamaChatMessage {
+        role: "system".to_string(),
+        content: format!(
+            "The user enabled this conversation summary for prompt context. Use it only as a transparent aid for this chat; the full visible message history follows.\n\nConversation summary v{} covering messages {}-{}:\n{}",
+            summary.version,
+            summary
+                .source_message_start_id
+                .map_or_else(|| "unknown".to_string(), |id| id.to_string()),
+            summary
+                .source_message_end_id
+                .map_or_else(|| "unknown".to_string(), |id| id.to_string()),
+            summary.summary
+        ),
+    }
+}
+
+fn update_conversation_summary_progress(
+    store: &ChatStore,
+    app: &AppHandle,
+    job_id: &str,
+    chat_title: &str,
+    progress_current: i64,
+    progress_total: i64,
+) -> Result<(), String> {
+    let label = if progress_current >= progress_total {
+        format!("Updated summary for {chat_title}")
+    } else {
+        format!("Summarizing {chat_title}")
+    };
+    let job = {
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        job_service::update_progress(
+            &conn,
+            job_id,
+            Some(progress_current),
+            Some(progress_total),
+            Some(&label),
+        )?
+    };
+
+    emit_job_event(app, &job)
+}
+
+fn finish_conversation_summary_cancelled(
+    store: &ChatStore,
+    job_id: &str,
+    completed_at: i64,
+) -> Result<Job, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    job_service::finish_cancelled(&conn, job_id, completed_at)
+}
+
+fn finish_conversation_summary_failed(
+    store: &ChatStore,
+    job_id: &str,
+    completed_at: i64,
+    error_message: &str,
+) -> Result<Job, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    job_service::finish_failed(&conn, job_id, error_message, completed_at)
+}
+
+fn run_conversation_summary_job(
+    store: ChatStore,
+    app: AppHandle,
+    job_id: String,
+    input: ConversationSummaryJobInput,
+    cancellation: Arc<AtomicBool>,
+) -> Result<ConversationSummaryJobOutput, String> {
+    let running_job = {
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        job_service::start(&conn, &job_id, now_millis()?)?
+    };
+    emit_job_event(&app, &running_job)?;
+
+    let installed_models = match model_service::list_models() {
+        Ok(models) => models,
+        Err(error) => {
+            let completed_at = now_millis()?;
+            let final_job =
+                finish_conversation_summary_failed(&store, &job_id, completed_at, &error)?;
+            emit_job_event(&app, &final_job)?;
+            return Ok(ConversationSummaryJobOutput {
+                job: final_job,
+                summary: None,
+            });
+        }
+    };
+
+    if !installed_models
+        .iter()
+        .any(|installed| installed.name == input.model)
+    {
+        let completed_at = now_millis()?;
+        let final_job = finish_conversation_summary_failed(
+            &store,
+            &job_id,
+            completed_at,
+            "Model is not installed. Install it before summarizing.",
+        )?;
+        emit_job_event(&app, &final_job)?;
+        return Ok(ConversationSummaryJobOutput {
+            job: final_job,
+            summary: None,
+        });
+    }
+
+    if cancellation.load(Ordering::SeqCst) {
+        let completed_at = now_millis()?;
+        let final_job = finish_conversation_summary_cancelled(&store, &job_id, completed_at)?;
+        emit_job_event(&app, &final_job)?;
+        return Ok(ConversationSummaryJobOutput {
+            job: final_job,
+            summary: None,
+        });
+    }
+
+    update_conversation_summary_progress(&store, &app, &job_id, &input.chat_title, 0, 1)?;
+
+    let stream_result = stream_ollama_chat(
+        input.model.clone(),
+        build_summary_prompt_messages(&input.messages),
+        cancellation.clone(),
+    );
+    let completed_at = now_millis()?;
+
+    match stream_result {
+        Ok(_) if cancellation.load(Ordering::SeqCst) => {
+            let final_job = finish_conversation_summary_cancelled(&store, &job_id, completed_at)?;
+            emit_job_event(&app, &final_job)?;
+            Ok(ConversationSummaryJobOutput {
+                job: final_job,
+                summary: None,
+            })
+        }
+        Ok(result) => {
+            let summary = {
+                let conn = store
+                    .conn
+                    .lock()
+                    .map_err(|_| "Database lock was poisoned".to_string())?;
+                summary_service::save_generated(
+                    &conn,
+                    &input.chat_id,
+                    &result.content,
+                    &input.messages,
+                    &input.model,
+                    input.preserve_enabled_for_prompt,
+                    completed_at,
+                )
+            };
+            let summary = match summary {
+                Ok(summary) => summary,
+                Err(error) => {
+                    let final_job =
+                        finish_conversation_summary_failed(&store, &job_id, completed_at, &error)?;
+                    emit_job_event(&app, &final_job)?;
+                    return Ok(ConversationSummaryJobOutput {
+                        job: final_job,
+                        summary: None,
+                    });
+                }
+            };
+
+            update_conversation_summary_progress(&store, &app, &job_id, &input.chat_title, 1, 1)?;
+            let result_json = serde_json::json!({
+              "chat_id": input.chat_id,
+              "summary_id": summary.id,
+              "source_message_start_id": summary.source_message_start_id,
+              "source_message_end_id": summary.source_message_end_id,
+              "model": input.model
+            })
+            .to_string();
+            let final_job = {
+                let conn = store
+                    .conn
+                    .lock()
+                    .map_err(|_| "Database lock was poisoned".to_string())?;
+                job_service::finish_succeeded(&conn, &job_id, Some(&result_json), completed_at)?
+            };
+            emit_job_event(&app, &final_job)?;
+            Ok(ConversationSummaryJobOutput {
+                job: final_job,
+                summary: Some(summary),
+            })
+        }
+        Err(error) if error.cancelled || cancellation.load(Ordering::SeqCst) => {
+            let final_job = finish_conversation_summary_cancelled(&store, &job_id, completed_at)?;
+            emit_job_event(&app, &final_job)?;
+            Ok(ConversationSummaryJobOutput {
+                job: final_job,
+                summary: None,
+            })
+        }
+        Err(error) => {
+            let final_job =
+                finish_conversation_summary_failed(&store, &job_id, completed_at, &error.message)?;
+            emit_job_event(&app, &final_job)?;
+            Ok(ConversationSummaryJobOutput {
+                job: final_job,
+                summary: None,
+            })
+        }
+    }
 }
 
 fn nanos_to_millis(nanos: Option<i64>) -> Option<i64> {
@@ -1441,6 +1713,74 @@ fn get_messages(store: State<'_, ChatStore>, chat_id: String) -> Result<Vec<Chat
 }
 
 #[tauri::command]
+fn get_conversation_summary(
+    store: State<'_, ChatStore>,
+    chat_id: String,
+) -> Result<Option<ConversationSummary>, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    summary_service::get_current(&conn, &chat_id)
+}
+
+#[tauri::command]
+fn save_conversation_summary(
+    store: State<'_, ChatStore>,
+    chat_id: String,
+    summary: String,
+    enabled_for_prompt: bool,
+) -> Result<ConversationSummary, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+
+    get_chat_summary(&conn, &chat_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Chat was not found".to_string())?;
+    let messages = summary_service::list_source_messages(&conn, &chat_id)?;
+    summary_service::save_manual(
+        &conn,
+        &chat_id,
+        &summary,
+        &messages,
+        enabled_for_prompt,
+        now_millis()?,
+    )
+}
+
+#[tauri::command]
+fn set_conversation_summary_enabled(
+    store: State<'_, ChatStore>,
+    chat_id: String,
+    enabled_for_prompt: bool,
+) -> Result<ConversationSummary, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+
+    if summary_service::get_current(&conn, &chat_id)?.is_none() {
+        return Err("Summary was not found.".to_string());
+    }
+
+    summary_service::set_enabled(&conn, &chat_id, enabled_for_prompt, now_millis()?)
+}
+
+#[tauri::command]
+fn delete_conversation_summary(
+    store: State<'_, ChatStore>,
+    chat_id: String,
+) -> Result<bool, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    summary_service::delete(&conn, &chat_id)
+}
+
+#[tauri::command]
 fn add_message(
     store: State<'_, ChatStore>,
     chat_id: String,
@@ -1735,6 +2075,155 @@ async fn start_model_benchmark(
 }
 
 #[tauri::command]
+async fn generate_conversation_summary(
+    app: AppHandle,
+    store: State<'_, ChatStore>,
+    tasks: State<'_, JobTasks>,
+    summary_tasks: State<'_, SummaryTasks>,
+    chat_id: String,
+    model: String,
+) -> Result<ConversationSummary, String> {
+    let chat_id = chat_id.trim().to_string();
+    if chat_id.is_empty() {
+        return Err("Open a chat before summarizing.".to_string());
+    }
+
+    let model = validate_ollama_model_name(&model)?;
+    let now = now_millis()?;
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let (job, input) = {
+        let mut active_by_chat_id = summary_tasks
+            .active_by_chat_id
+            .lock()
+            .map_err(|_| "Summary task lock was poisoned".to_string())?;
+
+        if active_by_chat_id.contains_key(&chat_id) {
+            return Err("A summary job is already running for this chat.".to_string());
+        }
+
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Database lock was poisoned".to_string())?;
+        let chat = get_chat_summary(&conn, &chat_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Chat was not found".to_string())?;
+        let messages = summary_service::list_source_messages(&conn, &chat_id)?;
+        if messages.is_empty() {
+            return Err("Chat has no messages to summarize.".to_string());
+        }
+
+        let existing_summary = summary_service::get_current(&conn, &chat_id)?;
+        let preserve_enabled_for_prompt = existing_summary
+            .as_ref()
+            .map(|summary| summary.enabled_for_prompt);
+        let (source_message_start_id, source_message_end_id) =
+            summary_service::source_message_range(&messages);
+        let payload_json = serde_json::json!({
+          "chat_id": &chat_id,
+          "model": &model,
+          "source_message_start_id": source_message_start_id,
+          "source_message_end_id": source_message_end_id
+        })
+        .to_string();
+        let job = job_service::create(
+            &conn,
+            JobType::ConversationSummary,
+            &format!("Queued summary for {}", chat.title),
+            Some(&payload_json),
+            now,
+        )?;
+        tasks
+            .tasks
+            .lock()
+            .map_err(|_| "Job task lock was poisoned".to_string())?
+            .insert(job.id.clone(), cancellation.clone());
+        active_by_chat_id.insert(chat_id.clone(), job.id.clone());
+        let input = ConversationSummaryJobInput {
+            chat_id: chat_id.clone(),
+            chat_title: chat.title,
+            model,
+            messages,
+            preserve_enabled_for_prompt,
+        };
+        (job, input)
+    };
+
+    if let Err(error) = emit_job_event(&app, &job) {
+        tasks
+            .tasks
+            .lock()
+            .map_err(|_| "Job task lock was poisoned".to_string())?
+            .remove(&job.id);
+        summary_tasks
+            .active_by_chat_id
+            .lock()
+            .map_err(|_| "Summary task lock was poisoned".to_string())?
+            .remove(&chat_id);
+        return Err(error);
+    }
+
+    let store_for_job = store.inner().clone();
+    let app_for_job = app.clone();
+    let job_id = job.id.clone();
+    let job_id_for_cleanup = job.id.clone();
+    let chat_id_for_cleanup = chat_id.clone();
+    let cancellation_for_job = cancellation.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        run_conversation_summary_job(
+            store_for_job,
+            app_for_job,
+            job_id,
+            input,
+            cancellation_for_job,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string());
+
+    {
+        let mut tasks = tasks
+            .tasks
+            .lock()
+            .map_err(|_| "Job task lock was poisoned".to_string())?;
+        if tasks
+            .get(&job_id_for_cleanup)
+            .is_some_and(|current_task| Arc::ptr_eq(current_task, &cancellation))
+        {
+            tasks.remove(&job_id_for_cleanup);
+        }
+    }
+    {
+        let mut active_by_chat_id = summary_tasks
+            .active_by_chat_id
+            .lock()
+            .map_err(|_| "Summary task lock was poisoned".to_string())?;
+        if active_by_chat_id
+            .get(&chat_id_for_cleanup)
+            .is_some_and(|active_job_id| active_job_id == &job_id_for_cleanup)
+        {
+            active_by_chat_id.remove(&chat_id_for_cleanup);
+        }
+    }
+
+    let output = result??;
+    match output.job.status {
+        JobStatus::Succeeded => output
+            .summary
+            .ok_or_else(|| "Summary was not saved.".to_string()),
+        JobStatus::Cancelled => Err("Job cancelled".to_string()),
+        JobStatus::Failed => Err(output
+            .job
+            .error_message
+            .clone()
+            .unwrap_or_else(|| "Job failed".to_string())),
+        _ => output
+            .summary
+            .ok_or_else(|| "Summary job did not complete.".to_string()),
+    }
+}
+
+#[tauri::command]
 async fn download_ollama_model(
     app: AppHandle,
     store: State<'_, ChatStore>,
@@ -1834,7 +2323,7 @@ async fn generate_assistant_response(
 ) -> Result<ChatMessage, String> {
     let model = validate_ollama_model_name(&model)?;
     let started_at = now_millis()?;
-    let messages = {
+    let (messages, prompt_summary) = {
         let conn = store
             .conn
             .lock()
@@ -1846,7 +2335,8 @@ async fn generate_assistant_response(
             return Err("Chat has no messages to send to Ollama".to_string());
         }
 
-        messages
+        let prompt_summary = summary_service::get_enabled_for_prompt(&conn, &chat_id)?;
+        (messages, prompt_summary)
     };
     let run_id = {
         let conn = store
@@ -1855,13 +2345,15 @@ async fn generate_assistant_response(
             .map_err(|_| "Database lock was poisoned".to_string())?;
         create_generation_run(&conn, &chat_id, &model, started_at)?
     };
-    let ollama_messages = messages
-        .into_iter()
-        .map(|message| OllamaChatMessage {
-            role: message.role,
-            content: message.content,
-        })
-        .collect::<Vec<_>>();
+    let mut ollama_messages =
+        Vec::with_capacity(messages.len() + usize::from(prompt_summary.is_some()));
+    if let Some(summary) = prompt_summary {
+        ollama_messages.push(summary_prompt_context(&summary));
+    }
+    ollama_messages.extend(messages.into_iter().map(|message| OllamaChatMessage {
+        role: message.role,
+        content: message.content,
+    }));
     let cancellation = Arc::new(AtomicBool::new(false));
 
     {
@@ -2017,6 +2509,7 @@ pub fn run() {
             app.manage(GenerationTasks::default());
             app.manage(JobTasks::default());
             app.manage(BenchmarkTasks::default());
+            app.manage(SummaryTasks::default());
 
             Ok(())
         })
@@ -2026,6 +2519,10 @@ pub fn run() {
             search_conversations,
             create_chat,
             get_messages,
+            get_conversation_summary,
+            save_conversation_summary,
+            set_conversation_summary_enabled,
+            delete_conversation_summary,
             add_message,
             delete_chat,
             export_chat,
@@ -2037,6 +2534,7 @@ pub fn run() {
             list_model_usage,
             cancel_job,
             start_model_benchmark,
+            generate_conversation_summary,
             download_ollama_model,
             delete_ollama_model,
             generate_assistant_response,
@@ -2054,7 +2552,9 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::app::{benchmarks as benchmark_service, jobs as job_service};
+    use super::app::{
+        benchmarks as benchmark_service, jobs as job_service, summaries as summary_service,
+    };
     use super::domain::benchmark::ModelBenchmarkStatus;
     use super::domain::job::{JobStatus, JobType};
     use super::domain::model::{
@@ -2333,6 +2833,78 @@ mod tests {
     }
 
     #[test]
+    fn summary_service_persists_edits_toggle_and_delete() {
+        let conn = Connection::open_in_memory().unwrap();
+        sqlite::setup_database(&conn).unwrap();
+        conn.execute(
+            "
+            INSERT INTO chats (id, title, created_at, updated_at)
+            VALUES ('chat-1', 'Summary Check', 100, 100)
+            ",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "
+            INSERT INTO messages (chat_id, role, content, created_at)
+            VALUES ('chat-1', 'user', 'We chose SQLite for local storage.', 125)
+            ",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "
+            INSERT INTO messages (chat_id, role, content, created_at)
+            VALUES ('chat-1', 'assistant', 'Keep summaries user-controlled.', 150)
+            ",
+            [],
+        )
+        .unwrap();
+
+        let source_messages = summary_service::list_source_messages(&conn, "chat-1").unwrap();
+        let summary = summary_service::save_manual(
+            &conn,
+            "chat-1",
+            "Current topic: Atlas summaries",
+            &source_messages,
+            false,
+            200,
+        )
+        .unwrap();
+
+        assert_eq!(summary.version, 1);
+        assert_eq!(summary.model_name, "manual");
+        assert_eq!(summary.source_message_start_id, Some(1));
+        assert_eq!(summary.source_message_end_id, Some(2));
+        assert!(!summary.enabled_for_prompt);
+
+        let enabled = summary_service::set_enabled(&conn, "chat-1", true, 225).unwrap();
+        assert!(enabled.enabled_for_prompt);
+        assert!(summary_service::get_enabled_for_prompt(&conn, "chat-1")
+            .unwrap()
+            .is_some());
+
+        let generated = summary_service::save_generated(
+            &conn,
+            "chat-1",
+            "Current topic: Atlas summaries\n\nKey decisions: Keep summaries visible.",
+            &source_messages,
+            "llama3.2:3b",
+            Some(enabled.enabled_for_prompt),
+            250,
+        )
+        .unwrap();
+        assert_eq!(generated.version, 2);
+        assert_eq!(generated.model_name, "llama3.2:3b");
+        assert!(generated.enabled_for_prompt);
+
+        assert!(summary_service::delete(&conn, "chat-1").unwrap());
+        assert!(summary_service::get_current(&conn, "chat-1")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn sqlite_setup_enables_wal_and_reports_safe_diagnostics() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2344,7 +2916,7 @@ mod tests {
         sqlite::setup_database(&conn).unwrap();
         let diagnostics = sqlite::diagnostics(&conn, &db_path).unwrap();
 
-        assert_eq!(diagnostics.user_version, 3);
+        assert_eq!(diagnostics.user_version, 4);
         assert_eq!(diagnostics.journal_mode, "wal");
         assert_eq!(diagnostics.integrity_check, "ok");
         assert!(diagnostics
@@ -2359,6 +2931,10 @@ mod tests {
             .table_counts
             .iter()
             .any(|table| table.table_name == "model_benchmarks" && table.row_count == 0));
+        assert!(diagnostics
+            .table_counts
+            .iter()
+            .any(|table| { table.table_name == "conversation_summaries" && table.row_count == 0 }));
 
         drop(conn);
         let _ = fs::remove_file(&db_path);

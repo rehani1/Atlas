@@ -10,19 +10,25 @@ import {
 import {
   cancelJob,
   deleteOllamaModel,
+  deleteConversationSummary,
   downloadOllamaModel,
   exportChat,
+  generateConversationSummary,
+  getConversationSummary,
   getDatabaseDiagnostics,
   getOllamaStatus,
   listModelBenchmarks,
   listModelUsage,
   listJobs,
+  saveConversationSummary,
   searchConversations,
+  setConversationSummaryEnabled,
   startModelBenchmark,
   type ChatExport,
   type ChatExportFormat,
   type ChatMessage,
   type ChatSearchResult,
+  type ConversationSummary,
   type DatabaseDiagnostics,
   type GenerationRun,
   type Job,
@@ -54,6 +60,7 @@ type CommandId =
   | 'chat.new'
   | 'chat.search'
   | 'chat.delete_active'
+  | 'chat.summary.open'
   | 'model.manager.open'
   | 'model.refresh'
   | 'model.switch.open'
@@ -79,6 +86,7 @@ type CommandRegistryContext = {
   activeChatId: string | null
   deletingChatId: string | null
   exportAction: ChatExportFormat | null
+  hasActiveConversationSummaryJob: boolean
   hasActiveModelBenchmarkJob: boolean
   hasActiveModelPullJob: boolean
   isDesktop: boolean
@@ -92,6 +100,7 @@ type CommandRegistryContext = {
   onExportChat: (format: ChatExportFormat) => Promise<void>
   onNewChat: () => Promise<void>
   onOpenChatSearch: () => void
+  onOpenConversationSummary: () => void
   onOpenDiagnostics: () => void
   onOpenModelLab: () => void
   onOpenModelManager: () => void
@@ -482,6 +491,22 @@ function getExportChatDisabledReason(context: CommandRegistryContext) {
   return undefined
 }
 
+function getConversationSummaryDisabledReason(context: CommandRegistryContext) {
+  if (!context.activeChatId) {
+    return 'Open a chat before summarizing.'
+  }
+
+  if (!context.isDesktop) {
+    return 'Conversation summaries require the Tauri desktop app.'
+  }
+
+  if (context.hasActiveConversationSummaryJob) {
+    return 'Wait for the current summary job to finish.'
+  }
+
+  return undefined
+}
+
 function saveChatExport(exportedChat: ChatExport) {
   const blob = new Blob([exportedChat.content], {
     type: exportedChat.mime_type,
@@ -549,9 +574,48 @@ function formatJobProgress(job: Job) {
     return `${job.progress_current} / ${job.progress_total} prompts`
   }
 
+  if (job.job_type === 'conversation_summary') {
+    return `${job.progress_current} / ${job.progress_total} steps`
+  }
+
   const currentMb = job.progress_current / 1024 / 1024
   const totalMb = job.progress_total / 1024 / 1024
   return `${currentMb.toFixed(1)} / ${totalMb.toFixed(1)} MB`
+}
+
+function getJobPayload(job: Job) {
+  if (!job.payload_json) {
+    return null
+  }
+
+  try {
+    const payload = JSON.parse(job.payload_json) as Record<string, unknown>
+    return payload
+  } catch {
+    return null
+  }
+}
+
+function getJobChatId(job: Job) {
+  const payload = getJobPayload(job)
+  return typeof payload?.chat_id === 'string' ? payload.chat_id : null
+}
+
+function formatSummaryRange(summary: ConversationSummary | null) {
+  if (
+    summary?.source_message_start_id === null ||
+    summary?.source_message_start_id === undefined ||
+    summary.source_message_end_id === null ||
+    summary.source_message_end_id === undefined
+  ) {
+    return 'No source range'
+  }
+
+  if (summary.source_message_start_id === summary.source_message_end_id) {
+    return `Message ${summary.source_message_start_id}`
+  }
+
+  return `Messages ${summary.source_message_start_id}-${summary.source_message_end_id}`
 }
 
 function buildCommandRegistry(context: CommandRegistryContext): AppCommand[] {
@@ -651,6 +715,16 @@ function buildCommandRegistry(context: CommandRegistryContext): AppCommand[] {
       keywords: ['download save transcript'],
       run: () => context.onExportChat(format.format),
     })
+  })
+
+  commands.push({
+    id: 'chat.summary.open',
+    title: 'Open chat summary',
+    category: 'Chat',
+    description: 'Inspect or update the current conversation summary.',
+    disabledReason: getConversationSummaryDisabledReason(context),
+    keywords: ['summarize context continuity'],
+    run: context.onOpenConversationSummary,
   })
 
   commands.push(
@@ -905,11 +979,42 @@ function DownloadIcon({ className = 'h-5 w-5' }: IconProps) {
   )
 }
 
+function SummaryIcon({ className = 'h-5 w-5' }: IconProps) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M6 3h9l3 3v15H6Z" />
+      <path d="M14 3v4h4" />
+      <path d="M9 11h6" />
+      <path d="M9 15h6" />
+      <path d="M9 19h4" />
+    </svg>
+  )
+}
+
 function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true)
   const [chats, setChats] = useState<ChatSummary[]>([])
   const [activeChatId, setActiveChatId] = useState<string | null>(null)
   const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [activeSummary, setActiveSummary] = useState<ConversationSummary | null>(
+    null,
+  )
+  const [summaryDraft, setSummaryDraft] = useState('')
+  const [isSummaryPanelOpen, setIsSummaryPanelOpen] = useState(false)
+  const [isSummaryLoading, setIsSummaryLoading] = useState(false)
+  const [summaryAction, setSummaryAction] = useState<
+    'generate' | 'save' | 'delete' | 'toggle' | null
+  >(null)
+  const [summaryError, setSummaryError] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
   const [historyError, setHistoryError] = useState<string | null>(null)
   const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(() =>
@@ -1062,6 +1167,15 @@ function App() {
         ) {
           void refreshModelLabData(false)
         }
+        const eventChatId = getJobChatId(event.payload.job)
+        if (
+          event.payload.job.job_type === 'conversation_summary' &&
+          !isActiveJob(event.payload.job) &&
+          eventChatId !== null &&
+          eventChatId === activeChatIdRef.current
+        ) {
+          void refreshSummaryForChat(eventChatId, false)
+        }
       }
     })
       .then((listener) => {
@@ -1105,6 +1219,37 @@ function App() {
       .catch((error: unknown) => {
         if (!ignore) {
           setHistoryError(String(error))
+        }
+      })
+
+    return () => {
+      ignore = true
+    }
+  }, [activeChatId])
+
+  useEffect(() => {
+    if (!activeChatId) {
+      return
+    }
+
+    if (!isTauriRuntime()) {
+      return
+    }
+
+    let ignore = false
+    const chatId = activeChatId
+
+    getConversationSummary(chatId)
+      .then((summary) => {
+        if (!ignore && activeChatIdRef.current === chatId) {
+          setActiveSummary(summary)
+          setSummaryDraft(summary?.summary ?? '')
+          setSummaryError(null)
+        }
+      })
+      .catch((error: unknown) => {
+        if (!ignore && activeChatIdRef.current === chatId) {
+          setSummaryError(String(error))
         }
       })
 
@@ -1273,6 +1418,160 @@ function App() {
     } finally {
       setIsOllamaStatusLoading(false)
       setModelAction(null)
+    }
+  }
+
+  async function refreshSummaryForChat(chatId: string, showLoading = true) {
+    try {
+      if (showLoading) {
+        setIsSummaryLoading(true)
+      }
+      const summary = await getConversationSummary(chatId)
+      if (activeChatIdRef.current === chatId) {
+        setActiveSummary(summary)
+        setSummaryDraft(summary?.summary ?? '')
+        setSummaryError(null)
+      }
+    } catch (error) {
+      if (activeChatIdRef.current === chatId) {
+        setSummaryError(String(error))
+      }
+    } finally {
+      if (showLoading) {
+        setIsSummaryLoading(false)
+      }
+    }
+  }
+
+  async function refreshActiveSummary(showLoading = true) {
+    if (!activeChatId || !isTauriRuntime()) {
+      setActiveSummary(null)
+      setSummaryDraft('')
+      return
+    }
+
+    await refreshSummaryForChat(activeChatId, showLoading)
+  }
+
+  function openConversationSummary() {
+    if (!activeChatId) {
+      setHistoryError('Open a chat before summarizing.')
+      return
+    }
+
+    setIsSummaryPanelOpen(true)
+    void refreshActiveSummary()
+  }
+
+  async function handleGenerateSummary() {
+    if (!activeChatId || !isTauriRuntime()) {
+      setSummaryError(
+        activeChatId
+          ? 'Conversation summaries require the Tauri desktop app.'
+          : 'Open a chat before summarizing.',
+      )
+      return
+    }
+
+    const chatBlockReason = getChatBlockReason(ollamaStatus, selectedModel)
+    if (chatBlockReason) {
+      setSummaryError(chatBlockReason)
+      return
+    }
+
+    const chatId = activeChatId
+
+    try {
+      setSummaryAction('generate')
+      const summary = await generateConversationSummary(chatId, selectedModel)
+      if (activeChatIdRef.current === chatId) {
+        setActiveSummary(summary)
+        setSummaryDraft(summary.summary)
+      }
+      setSummaryError(null)
+    } catch (error) {
+      const details = String(error)
+      if (details !== 'Job cancelled') {
+        setSummaryError(details)
+      }
+      await refreshActiveSummary(false)
+    } finally {
+      setSummaryAction(null)
+    }
+  }
+
+  async function handleSaveSummary() {
+    if (!activeChatId || !isTauriRuntime()) {
+      setSummaryError(
+        activeChatId
+          ? 'Conversation summaries require the Tauri desktop app.'
+          : 'Open a chat before summarizing.',
+      )
+      return
+    }
+
+    const chatId = activeChatId
+
+    try {
+      setSummaryAction('save')
+      const summary = await saveConversationSummary(
+        chatId,
+        summaryDraft,
+        activeSummary?.enabled_for_prompt ?? false,
+      )
+      if (activeChatIdRef.current === chatId) {
+        setActiveSummary(summary)
+        setSummaryDraft(summary.summary)
+      }
+      setSummaryError(null)
+    } catch (error) {
+      setSummaryError(String(error))
+    } finally {
+      setSummaryAction(null)
+    }
+  }
+
+  async function handleToggleSummaryUse(enabledForPrompt: boolean) {
+    if (!activeChatId || !activeSummary || !isTauriRuntime()) {
+      return
+    }
+
+    const chatId = activeChatId
+
+    try {
+      setSummaryAction('toggle')
+      const summary = await setConversationSummaryEnabled(chatId, enabledForPrompt)
+      if (activeChatIdRef.current === chatId) {
+        setActiveSummary(summary)
+        setSummaryDraft(summary.summary)
+      }
+      setSummaryError(null)
+    } catch (error) {
+      setSummaryError(String(error))
+    } finally {
+      setSummaryAction(null)
+    }
+  }
+
+  async function handleDeleteSummary() {
+    if (!activeChatId || !isTauriRuntime()) {
+      return
+    }
+
+    const chatId = activeChatId
+
+    try {
+      setSummaryAction('delete')
+      await deleteConversationSummary(chatId)
+      if (activeChatIdRef.current === chatId) {
+        setActiveSummary(null)
+        setSummaryDraft('')
+      }
+      setSummaryError(null)
+    } catch (error) {
+      setSummaryError(String(error))
+    } finally {
+      setSummaryAction(null)
     }
   }
 
@@ -1464,6 +1763,10 @@ function App() {
     setPendingSearchJump(null)
     setHighlightedMessageId(null)
     setIsExportMenuOpen(false)
+    setIsSummaryPanelOpen(false)
+    setActiveSummary(null)
+    setSummaryDraft('')
+    setSummaryError(null)
     closeChatSearch()
   }
 
@@ -1473,6 +1776,9 @@ function App() {
 
   async function handleSelectChat(chatId: string) {
     setActiveChatId(chatId)
+    setActiveSummary(null)
+    setSummaryDraft('')
+    setSummaryError(null)
     setIsExportMenuOpen(false)
     setPendingSearchJump(null)
     closeChatSearch()
@@ -1480,6 +1786,9 @@ function App() {
 
   function handleSelectSearchResult(result: ChatSearchResult) {
     setActiveChatId(result.chat_id)
+    setActiveSummary(null)
+    setSummaryDraft('')
+    setSummaryError(null)
     setIsExportMenuOpen(false)
     setPendingSearchJump(
       result.message_id === null
@@ -1628,6 +1937,10 @@ function App() {
       setMessages([])
       setDraft('')
       setIsExportMenuOpen(false)
+      setIsSummaryPanelOpen(false)
+      setActiveSummary(null)
+      setSummaryDraft('')
+      setSummaryError(null)
       setHistoryError(null)
 
       if (respondingChatId === chatId) {
@@ -1694,6 +2007,17 @@ function App() {
   const activeModelBenchmarkProgress = activeModelBenchmarkJob
     ? getJobProgressPercent(activeModelBenchmarkJob)
     : null
+  const activeConversationSummaryJob = activeChatId
+    ? jobs.find(
+        (job) =>
+          job.job_type === 'conversation_summary' &&
+          isActiveJob(job) &&
+          getJobChatId(job) === activeChatId,
+      )
+    : undefined
+  const activeConversationSummaryProgress = activeConversationSummaryJob
+    ? getJobProgressPercent(activeConversationSummaryJob)
+    : null
   const modelUsageByName = new Map(
     modelUsage.map((usage) => [usage.model_name, usage]),
   )
@@ -1724,6 +2048,7 @@ function App() {
     activeChatId,
     deletingChatId,
     exportAction,
+    hasActiveConversationSummaryJob: activeConversationSummaryJob !== undefined,
     hasActiveModelBenchmarkJob: activeModelBenchmarkJob !== undefined,
     hasActiveModelPullJob: activeModelPullJob !== undefined,
     isDesktop: isTauriRuntime(),
@@ -1737,6 +2062,7 @@ function App() {
     onExportChat: handleExportActiveChat,
     onNewChat: handleNewChat,
     onOpenChatSearch: openChatSearch,
+    onOpenConversationSummary: openConversationSummary,
     onOpenDiagnostics: openDiagnostics,
     onOpenModelLab: openModelLab,
     onOpenModelManager: openModelManager,
@@ -1985,6 +2311,23 @@ function App() {
       <main className="relative min-h-svh min-w-0 flex-1 overflow-hidden" aria-label="Chat">
         {activeChatId ? (
           <div className="absolute top-4 right-4 z-10 flex items-start gap-2">
+            <button
+              className={`grid h-10 w-10 place-items-center rounded-xl border shadow-[0_12px_36px_rgba(0,0,0,0.35)] transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                activeSummary?.enabled_for_prompt
+                  ? 'border-zinc-500 bg-zinc-100 text-zinc-950 hover:bg-white'
+                  : 'border-zinc-800 bg-black/90 text-zinc-300 hover:bg-zinc-950 hover:text-zinc-100'
+              }`}
+              type="button"
+              aria-label={
+                activeSummary?.enabled_for_prompt
+                  ? 'Open chat summary, prompt use enabled'
+                  : 'Open chat summary'
+              }
+              onClick={openConversationSummary}
+            >
+              <SummaryIcon />
+            </button>
+
             <div className="relative">
               <button
                 className="grid h-10 w-10 place-items-center rounded-xl border border-zinc-800 bg-black/90 text-zinc-300 shadow-[0_12px_36px_rgba(0,0,0,0.35)] transition-colors hover:bg-zinc-950 hover:text-zinc-100 disabled:cursor-not-allowed disabled:opacity-50"
@@ -2263,6 +2606,26 @@ function App() {
               </section>
             ) : null}
 
+            {activeSummary?.enabled_for_prompt ? (
+              <section className="mr-auto flex max-w-[min(100%,34rem)] flex-wrap items-center justify-between gap-3 rounded-2xl border border-zinc-800 bg-zinc-950 px-4 py-3 text-sm text-zinc-200">
+                <div className="min-w-0">
+                  <p className="font-medium text-zinc-100">
+                    Summary context on
+                  </p>
+                  <p className="mt-1 text-xs text-zinc-500">
+                    {formatSummaryRange(activeSummary)} - v{activeSummary.version}
+                  </p>
+                </div>
+                <button
+                  className="rounded-lg border border-zinc-700 px-2.5 py-1 text-xs font-medium text-zinc-200 transition-colors hover:bg-zinc-900"
+                  type="button"
+                  onClick={openConversationSummary}
+                >
+                  Edit
+                </button>
+              </section>
+            ) : null}
+
             {messages.map((message) => (
               <article
                 className={`max-w-[78%] overflow-hidden rounded-2xl px-4 py-3 text-sm leading-6 break-words transition-[box-shadow,outline-color] ${
@@ -2412,6 +2775,204 @@ function App() {
             )
           })}
         </section>
+      ) : null}
+
+      {isSummaryPanelOpen ? (
+        <div
+          className="fixed inset-0 z-50 bg-black/70 px-4 py-[8vh]"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setIsSummaryPanelOpen(false)
+            }
+          }}
+        >
+          <section
+            className="mx-auto flex max-h-[84vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-950 shadow-[0_24px_80px_rgba(0,0,0,0.55)]"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Conversation summary"
+          >
+            <header className="flex items-start justify-between gap-4 border-b border-zinc-800 px-4 py-3">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-zinc-100">
+                  Conversation Summary
+                </p>
+                <p className="mt-0.5 text-xs text-zinc-500">
+                  {activeSummary
+                    ? `${formatSummaryRange(activeSummary)} - ${activeSummary.model_name}`
+                    : 'No summary saved'}
+                </p>
+              </div>
+              <button
+                className="grid h-8 w-8 place-items-center rounded-lg border-0 bg-transparent text-zinc-500 transition-colors hover:bg-zinc-900 hover:text-zinc-100"
+                type="button"
+                aria-label="Close conversation summary"
+                onClick={() => setIsSummaryPanelOpen(false)}
+              >
+                <XIcon />
+              </button>
+            </header>
+
+            <div className="grid gap-4 overflow-y-auto p-4">
+              {summaryError ? (
+                <p className="rounded-xl border border-red-900/60 bg-red-950/30 px-3 py-2 text-sm text-red-200">
+                  {summaryError}
+                </p>
+              ) : null}
+
+              {activeConversationSummaryJob ? (
+                <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 px-3 py-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium text-zinc-100">
+                        {activeConversationSummaryJob.label}
+                      </p>
+                      <p className="mt-0.5 text-xs text-zinc-500">
+                        {formatJobProgress(activeConversationSummaryJob)}
+                      </p>
+                    </div>
+                    <button
+                      className="rounded-lg border border-zinc-700 px-2.5 py-1 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+                      type="button"
+                      disabled={activeConversationSummaryJob.status === 'cancelling'}
+                      onClick={() =>
+                        handleCancelJob(activeConversationSummaryJob.id)
+                      }
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                  {activeConversationSummaryProgress !== null ? (
+                    <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-zinc-950">
+                      <div
+                        className="h-full rounded-full bg-zinc-100 transition-[width]"
+                        style={{
+                          width: `${activeConversationSummaryProgress}%`,
+                        }}
+                      />
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+
+              <div className="grid gap-2 sm:grid-cols-3">
+                <div className="rounded-xl bg-zinc-900/70 px-3 py-2">
+                  <p className="text-xs text-zinc-600">Version</p>
+                  <p className="mt-1 text-sm text-zinc-100">
+                    {activeSummary ? `v${activeSummary.version}` : 'None'}
+                  </p>
+                </div>
+                <div className="rounded-xl bg-zinc-900/70 px-3 py-2">
+                  <p className="text-xs text-zinc-600">Updated</p>
+                  <p className="mt-1 truncate text-sm text-zinc-100">
+                    {formatTimestamp(activeSummary?.updated_at)}
+                  </p>
+                </div>
+                <div className="rounded-xl bg-zinc-900/70 px-3 py-2">
+                  <p className="text-xs text-zinc-600">Model</p>
+                  <p className="mt-1 truncate text-sm text-zinc-100">
+                    {activeSummary?.model_name ?? 'None'}
+                  </p>
+                </div>
+              </div>
+
+              <label className="flex items-center justify-between gap-3 rounded-xl border border-zinc-800 bg-zinc-900/50 px-3 py-2 text-sm text-zinc-200">
+                <span className="min-w-0">
+                  <span className="block font-medium text-zinc-100">
+                    Use in prompts
+                  </span>
+                  <span className="mt-0.5 block text-xs text-zinc-500">
+                    {activeSummary
+                      ? activeSummary.enabled_for_prompt
+                        ? 'Enabled for this chat'
+                        : 'Disabled for this chat'
+                      : 'Save a summary first'}
+                  </span>
+                </span>
+                <input
+                  className="h-5 w-5 flex-none accent-zinc-100"
+                  type="checkbox"
+                  checked={activeSummary?.enabled_for_prompt ?? false}
+                  disabled={
+                    !activeSummary ||
+                    summaryAction !== null ||
+                    activeConversationSummaryJob !== undefined
+                  }
+                  onChange={(event) =>
+                    void handleToggleSummaryUse(event.target.checked)
+                  }
+                />
+              </label>
+
+              <div>
+                <label
+                  className="mb-2 block text-xs font-semibold tracking-[0.08em] text-zinc-500 uppercase"
+                  htmlFor="conversation-summary"
+                >
+                  Summary
+                </label>
+                <textarea
+                  className="min-h-72 w-full resize-y rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-3 text-sm leading-6 text-zinc-100 outline-none transition-colors placeholder:text-zinc-600 focus:border-zinc-600"
+                  id="conversation-summary"
+                  placeholder={
+                    isSummaryLoading
+                      ? 'Loading summary...'
+                      : 'Generate or write a summary for this conversation.'
+                  }
+                  value={summaryDraft}
+                  onChange={(event) => setSummaryDraft(event.target.value)}
+                />
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <button
+                  className="h-9 rounded-lg bg-zinc-100 px-3 text-sm font-semibold text-zinc-950 transition-colors hover:bg-white disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500"
+                  type="button"
+                  disabled={
+                    summaryAction !== null ||
+                    activeConversationSummaryJob !== undefined ||
+                    isResponding ||
+                    !selectedModel
+                  }
+                  onClick={handleGenerateSummary}
+                >
+                  {summaryAction === 'generate'
+                    ? 'Generating'
+                    : activeSummary
+                      ? 'Update summary'
+                      : 'Generate summary'}
+                </button>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    className="h-9 rounded-lg border border-zinc-800 px-3 text-sm font-medium text-zinc-300 transition-colors hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+                    type="button"
+                    disabled={
+                      summaryAction !== null ||
+                      activeConversationSummaryJob !== undefined ||
+                      !summaryDraft.trim()
+                    }
+                    onClick={handleSaveSummary}
+                  >
+                    {summaryAction === 'save' ? 'Saving' : 'Save edits'}
+                  </button>
+                  <button
+                    className="h-9 rounded-lg border border-red-950/80 px-3 text-sm font-medium text-red-300 transition-colors hover:bg-red-950/30 disabled:cursor-not-allowed disabled:opacity-50"
+                    type="button"
+                    disabled={
+                      !activeSummary ||
+                      summaryAction !== null ||
+                      activeConversationSummaryJob !== undefined
+                    }
+                    onClick={handleDeleteSummary}
+                  >
+                    {summaryAction === 'delete' ? 'Deleting' : 'Delete'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
       ) : null}
 
       {isModelLabOpen ? (
