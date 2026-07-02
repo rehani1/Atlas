@@ -94,6 +94,25 @@ export type JobEvent = {
   job: Job
 }
 
+export type DatabaseTableCount = {
+  table_name: string
+  row_count: number
+}
+
+export type DatabaseDiagnostics = {
+  path: string
+  database_size_bytes: number
+  wal_size_bytes: number
+  shm_size_bytes: number
+  journal_mode: string
+  user_version: number
+  page_count: number
+  page_size: number
+  freelist_count: number
+  integrity_check: string
+  table_counts: DatabaseTableCount[]
+}
+
 const commands = {
   getOllamaStatus: 'get_ollama_status',
   downloadOllamaModel: 'download_ollama_model',
@@ -101,6 +120,7 @@ const commands = {
   exportChat: 'export_chat',
   listJobs: 'list_jobs',
   cancelJob: 'cancel_job',
+  getDatabaseDiagnostics: 'get_database_diagnostics',
 } as const
 
 export function getOllamaStatus(selectedModel?: string) {
@@ -127,4 +147,8 @@ export function listJobs(limit = 10) {
 
 export function cancelJob(jobId: string) {
   return invoke<Job>(commands.cancelJob, { jobId })
+}
+
+export function getDatabaseDiagnostics() {
+  return invoke<DatabaseDiagnostics>(commands.getDatabaseDiagnostics)
 }

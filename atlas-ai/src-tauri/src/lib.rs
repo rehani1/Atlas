@@ -3,9 +3,10 @@ mod domain;
 mod infra;
 
 use app::{jobs as job_service, models as model_service};
+use domain::database::DatabaseDiagnostics;
 use domain::job::{Job, JobEvent, JobStatus, JobType};
 use domain::model::{validate_ollama_model_name, OllamaModel, OllamaStatus};
-use infra::{jobs as job_repository, ollama};
+use infra::{jobs as job_repository, ollama, sqlite};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -23,6 +24,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 #[derive(Clone)]
 struct ChatStore {
     conn: Arc<Mutex<Connection>>,
+    db_path: PathBuf,
 }
 
 #[derive(Default)]
@@ -154,68 +156,8 @@ struct OllamaChatStreamError {
 
 impl ChatStore {
     fn new(db_path: PathBuf) -> Result<Self, rusqlite::Error> {
-        let conn = Connection::open(db_path)?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(
-            "
-      CREATE TABLE IF NOT EXISTS chats (
-        id TEXT PRIMARY KEY,
-        title TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
-        role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system')),
-        content TEXT NOT NULL,
-        created_at INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS generation_runs (
-        id TEXT PRIMARY KEY,
-        conversation_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
-        message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
-        model_name TEXT NOT NULL,
-        started_at INTEGER NOT NULL,
-        first_token_at INTEGER,
-        completed_at INTEGER,
-        status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'cancelled', 'failed')),
-        total_duration_ms INTEGER,
-        load_duration_ms INTEGER,
-        prompt_eval_count INTEGER,
-        prompt_eval_duration_ms INTEGER,
-        eval_count INTEGER,
-        eval_duration_ms INTEGER,
-        tokens_per_second REAL,
-        error_message TEXT
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_chats_updated_at
-        ON chats(updated_at DESC);
-
-      CREATE INDEX IF NOT EXISTS idx_messages_chat_id_created_at
-        ON messages(chat_id, created_at, id);
-
-      CREATE INDEX IF NOT EXISTS idx_generation_runs_conversation_started
-        ON generation_runs(conversation_id, started_at DESC);
-
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_generation_runs_message_id
-        ON generation_runs(message_id)
-        WHERE message_id IS NOT NULL;
-
-      CREATE TRIGGER IF NOT EXISTS messages_after_insert_update_chat
-      AFTER INSERT ON messages
-      BEGIN
-        UPDATE chats
-        SET updated_at = NEW.created_at
-        WHERE id = NEW.chat_id;
-      END;
-      ",
-        )?;
-
-        job_repository::create_schema(&conn)?;
+        let conn = Connection::open(&db_path)?;
+        sqlite::setup_database(&conn)?;
         let recovered_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as i64)
@@ -224,6 +166,7 @@ impl ChatStore {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            db_path,
         })
     }
 }
@@ -1330,6 +1273,15 @@ fn list_jobs(store: State<'_, ChatStore>, limit: Option<i64>) -> Result<Vec<Job>
 }
 
 #[tauri::command]
+fn get_database_diagnostics(store: State<'_, ChatStore>) -> Result<DatabaseDiagnostics, String> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    sqlite::diagnostics(&conn, &store.db_path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn cancel_job(
     app: AppHandle,
     store: State<'_, ChatStore>,
@@ -1663,6 +1615,7 @@ pub fn run() {
             get_ollama_status,
             list_ollama_models,
             list_jobs,
+            get_database_diagnostics,
             cancel_job,
             download_ollama_model,
             delete_ollama_model,
@@ -1676,13 +1629,17 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use rusqlite::Connection;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use super::app::jobs as job_service;
     use super::domain::job::{JobStatus, JobType};
     use super::domain::model::{
         build_ollama_status, validate_ollama_model_name, OllamaModel, OllamaStatusKind,
     };
-    use super::infra::jobs as job_repository;
+    use super::infra::{jobs as job_repository, sqlite};
     use super::{
         calculate_tokens_per_second, escape_like_pattern, format_timestamp_ms, nanos_to_millis,
         normalize_title, render_chat_export, sanitize_file_name, ChatExportFormat, ChatMessage,
@@ -1898,6 +1855,32 @@ mod tests {
             recovered.error_message.as_deref(),
             Some("Job interrupted because Atlas was closed.")
         );
+    }
+
+    #[test]
+    fn sqlite_setup_enables_wal_and_reports_safe_diagnostics() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!("atlas-sqlite-test-{unique}.sqlite3"));
+        let conn = Connection::open(&db_path).unwrap();
+
+        sqlite::setup_database(&conn).unwrap();
+        let diagnostics = sqlite::diagnostics(&conn, &db_path).unwrap();
+
+        assert_eq!(diagnostics.user_version, 1);
+        assert_eq!(diagnostics.journal_mode, "wal");
+        assert_eq!(diagnostics.integrity_check, "ok");
+        assert!(diagnostics
+            .table_counts
+            .iter()
+            .any(|table| table.table_name == "jobs" && table.row_count == 0));
+
+        drop(conn);
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(format!("{}-wal", db_path.display()));
+        let _ = fs::remove_file(format!("{}-shm", db_path.display()));
     }
 
     #[test]

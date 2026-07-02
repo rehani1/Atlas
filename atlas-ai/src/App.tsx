@@ -12,11 +12,13 @@ import {
   deleteOllamaModel,
   downloadOllamaModel,
   exportChat,
+  getDatabaseDiagnostics,
   getOllamaStatus,
   listJobs,
   type ChatExport,
   type ChatExportFormat,
   type ChatMessage,
+  type DatabaseDiagnostics,
   type GenerationRun,
   type Job,
   type JobEvent,
@@ -82,6 +84,7 @@ type CommandRegistryContext = {
   onExportChat: (format: ChatExportFormat) => Promise<void>
   onNewChat: () => Promise<void>
   onOpenChatSearch: () => void
+  onOpenDiagnostics: () => void
   onOpenModelManager: () => void
   onRefreshModels: () => Promise<void>
   onSelectModel: (model: string) => void
@@ -118,6 +121,23 @@ function titleFromMessage(content: string) {
 function formatModelSize(size: number) {
   if (size <= 0) {
     return 'Unknown size'
+  }
+
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = size
+  let unitIndex = 0
+
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+
+  return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`
+}
+
+function formatBytes(size: number) {
+  if (size <= 0) {
+    return '0 B'
   }
 
   const units = ['B', 'KB', 'MB', 'GB']
@@ -579,10 +599,12 @@ function buildCommandRegistry(context: CommandRegistryContext): AppCommand[] {
       id: 'diagnostics.open',
       title: 'Open diagnostics',
       category: 'App',
-      description: 'Review local app health.',
-      disabledReason: 'Diagnostics Center lands in Chunk 15.',
+      description: 'Review local database health.',
+      disabledReason: context.isDesktop
+        ? undefined
+        : 'Diagnostics require the Tauri desktop app.',
       keywords: ['health status'],
-      run: () => undefined,
+      run: context.onOpenDiagnostics,
     },
     {
       id: 'model_lab.open',
@@ -845,6 +867,14 @@ function App() {
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false)
   const [commandQuery, setCommandQuery] = useState('')
   const [activeCommandIndex, setActiveCommandIndex] = useState(0)
+  const [isDiagnosticsOpen, setIsDiagnosticsOpen] = useState(false)
+  const [databaseDiagnostics, setDatabaseDiagnostics] =
+    useState<DatabaseDiagnostics | null>(null)
+  const [isDatabaseDiagnosticsLoading, setIsDatabaseDiagnosticsLoading] =
+    useState(false)
+  const [databaseDiagnosticsError, setDatabaseDiagnosticsError] = useState<
+    string | null
+  >(null)
   const activeChatIdRef = useRef<string | null>(null)
   const commandInputRef = useRef<HTMLInputElement | null>(null)
 
@@ -1163,6 +1193,28 @@ function App() {
     }
   }
 
+  async function refreshDatabaseDiagnostics() {
+    if (!isTauriRuntime()) {
+      setDatabaseDiagnosticsError('Diagnostics require the Tauri desktop app.')
+      return
+    }
+
+    try {
+      setIsDatabaseDiagnosticsLoading(true)
+      setDatabaseDiagnostics(await getDatabaseDiagnostics())
+      setDatabaseDiagnosticsError(null)
+    } catch (error) {
+      setDatabaseDiagnosticsError(String(error))
+    } finally {
+      setIsDatabaseDiagnosticsLoading(false)
+    }
+  }
+
+  function openDiagnostics() {
+    setIsDiagnosticsOpen(true)
+    void refreshDatabaseDiagnostics()
+  }
+
   async function handleDeleteModel(model: string) {
     if (!isTauriRuntime()) {
       setModelError({
@@ -1463,6 +1515,7 @@ function App() {
     onExportChat: handleExportActiveChat,
     onNewChat: handleNewChat,
     onOpenChatSearch: openChatSearch,
+    onOpenDiagnostics: openDiagnostics,
     onOpenModelManager: openModelManager,
     onRefreshModels: refreshOllamaModels,
     onSelectModel: handleSelectModel,
@@ -2074,6 +2127,121 @@ function App() {
             )
           })}
         </section>
+      ) : null}
+
+      {isDiagnosticsOpen ? (
+        <div
+          className="fixed inset-0 z-50 bg-black/70 px-4 py-[10vh]"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setIsDiagnosticsOpen(false)
+            }
+          }}
+        >
+          <section
+            className="mx-auto w-full max-w-2xl overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-950 shadow-[0_24px_80px_rgba(0,0,0,0.55)]"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Database diagnostics"
+          >
+            <header className="flex items-start justify-between gap-4 border-b border-zinc-800 px-4 py-3">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-zinc-100">
+                  Database diagnostics
+                </p>
+                <p className="mt-0.5 text-xs text-zinc-500">
+                  SQLite storage and integrity
+                </p>
+              </div>
+              <div className="flex flex-none items-center gap-2">
+                <button
+                  className="h-8 rounded-lg border border-zinc-800 px-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+                  type="button"
+                  disabled={isDatabaseDiagnosticsLoading}
+                  onClick={refreshDatabaseDiagnostics}
+                >
+                  {isDatabaseDiagnosticsLoading ? 'Checking' : 'Refresh'}
+                </button>
+                <button
+                  className="grid h-8 w-8 place-items-center rounded-lg border-0 bg-transparent text-zinc-500 transition-colors hover:bg-zinc-900 hover:text-zinc-100"
+                  type="button"
+                  aria-label="Close diagnostics"
+                  onClick={() => setIsDiagnosticsOpen(false)}
+                >
+                  <XIcon />
+                </button>
+              </div>
+            </header>
+
+            <div className="max-h-[min(34rem,70vh)] overflow-y-auto p-4">
+              {databaseDiagnosticsError ? (
+                <p className="mb-3 rounded-xl border border-red-900/60 bg-red-950/30 px-3 py-2 text-sm text-red-200">
+                  {databaseDiagnosticsError}
+                </p>
+              ) : null}
+
+              {databaseDiagnostics ? (
+                <div className="grid gap-4">
+                  <div className="rounded-xl bg-zinc-900/70 px-3 py-2">
+                    <p className="text-xs text-zinc-500">Path</p>
+                    <p className="mt-1 break-all text-sm text-zinc-100">
+                      {databaseDiagnostics.path}
+                    </p>
+                  </div>
+
+                  <dl className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                    {[
+                      ['Database', formatBytes(databaseDiagnostics.database_size_bytes)],
+                      ['WAL', formatBytes(databaseDiagnostics.wal_size_bytes)],
+                      ['Shared memory', formatBytes(databaseDiagnostics.shm_size_bytes)],
+                      ['Journal', databaseDiagnostics.journal_mode],
+                      ['Schema', `v${databaseDiagnostics.user_version}`],
+                      ['Integrity', databaseDiagnostics.integrity_check],
+                      ['Pages', databaseDiagnostics.page_count.toLocaleString()],
+                      ['Page size', formatBytes(databaseDiagnostics.page_size)],
+                      ['Free pages', databaseDiagnostics.freelist_count.toLocaleString()],
+                    ].map(([label, value]) => (
+                      <div
+                        className="min-w-0 rounded-xl bg-zinc-900/70 px-3 py-2"
+                        key={label}
+                      >
+                        <dt className="text-xs text-zinc-500">{label}</dt>
+                        <dd className="mt-1 truncate text-sm text-zinc-100">
+                          {value}
+                        </dd>
+                      </div>
+                    ))}
+                  </dl>
+
+                  <div>
+                    <p className="mb-2 text-xs font-semibold tracking-[0.08em] text-zinc-500 uppercase">
+                      Tables
+                    </p>
+                    <div className="grid gap-1">
+                      {databaseDiagnostics.table_counts.map((table) => (
+                        <div
+                          className="flex items-center justify-between gap-3 rounded-lg bg-zinc-900/70 px-3 py-2 text-sm"
+                          key={table.table_name}
+                        >
+                          <span className="text-zinc-300">{table.table_name}</span>
+                          <span className="text-zinc-500">
+                            {table.row_count.toLocaleString()}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <p className="py-8 text-center text-sm text-zinc-500">
+                  {isDatabaseDiagnosticsLoading
+                    ? 'Checking database...'
+                    : 'No diagnostics loaded.'}
+                </p>
+              )}
+            </div>
+          </section>
+        </div>
       ) : null}
 
       {isCommandPaletteOpen ? (

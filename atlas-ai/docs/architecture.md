@@ -2,9 +2,8 @@
 
 Last audited: 2026-07-02
 
-This document records the current Atlas `1.0.0` architecture before the remake
-chunks start changing product behavior. It is descriptive, not the target
-architecture.
+This document records the current Atlas `1.0.0` architecture during the remake
+chunks. It is descriptive, not the target architecture.
 
 ## Scope
 
@@ -12,20 +11,22 @@ Atlas is a local-first desktop chat app built with Tauri 2, Rust, React, Vite,
 Tailwind CSS, SQLite, and Ollama. The current codebase is intentionally compact:
 
 - Frontend UI and state live in `src/App.tsx`.
-- Most backend state, SQLite access, command handlers, streaming, and
+- Most backend state, SQLite repositories, command handlers, streaming, and
   cancellation still live in `src-tauri/src/lib.rs`.
-- Backend service slices now include model management and jobs:
+- Backend service slices now include model management, jobs, and database
+  setup/diagnostics:
   `src-tauri/src/domain/model.rs`, `src-tauri/src/app/models.rs`,
   `src-tauri/src/domain/job.rs`, `src-tauri/src/app/jobs.rs`,
-  `src-tauri/src/infra/jobs.rs`, and `src-tauri/src/infra/ollama.rs`.
+  `src-tauri/src/infra/jobs.rs`, `src-tauri/src/domain/database.rs`,
+  `src-tauri/src/infra/sqlite.rs`, and `src-tauri/src/infra/ollama.rs`.
 - `src-tauri/src/main.rs` only starts `atlas_lib::run()`.
 - Public release docs are `README.md` and `CHANGELOG.md`.
 
-There is a minimal typed frontend API wrapper for touched Ollama status and
-model lifecycle commands in `src/shared/api/tauri.ts`. There are no frontend
-feature folders, Rust `commands` module, database migration files, job tables,
-event envelopes, diagnostics views, document indexing, memory, import, or model
-benchmark surfaces yet.
+There is a minimal typed frontend API wrapper for touched Ollama status, model
+lifecycle, export, jobs, and database diagnostics commands in
+`src/shared/api/tauri.ts`. There are no frontend feature folders, Rust
+`commands` module, database migrations directory, document indexing, memory,
+import, or model benchmark surfaces yet.
 
 `src/App.tsx` now also owns a small frontend-only command registry and
 `Cmd/Ctrl+K` command palette. The registry uses stable command IDs and routes
@@ -58,7 +59,7 @@ Current Tauri permissions are limited to `core:default` in
 
 Rust owns privileged operations:
 
-- SQLite connection and queries.
+- SQLite connection, schema setup, diagnostics, and queries.
 - Chat and message persistence.
 - Ollama readiness, model list, pull, delete, and chat requests.
 - Model name validation.
@@ -97,6 +98,7 @@ list_ollama_models() -> Vec<OllamaModel>
 download_ollama_model(model: String) -> Job
 delete_ollama_model(model: String) -> Vec<OllamaModel>
 list_jobs(limit: Option<i64>) -> Vec<Job>
+get_database_diagnostics() -> DatabaseDiagnostics
 cancel_job(job_id: String) -> Job
 generate_assistant_response(chat_id: String, model: String) -> ChatMessage
 cancel_ollama_generation(chat_id: String) -> bool
@@ -178,6 +180,23 @@ JobEvent
 - job_id: string
 - job_type: Job.job_type
 - job: Job
+
+DatabaseTableCount
+- table_name: string
+- row_count: number
+
+DatabaseDiagnostics
+- path: string
+- database_size_bytes: number
+- wal_size_bytes: number
+- shm_size_bytes: number
+- journal_mode: string
+- user_version: number
+- page_count: number
+- page_size: number
+- freelist_count: number
+- integrity_check: string
+- table_counts: DatabaseTableCount[]
 ```
 
 The backend emits `job_updated` events for job creation, start, progress,
@@ -192,14 +211,23 @@ SQLite is opened during Tauri setup at:
 app.path().app_data_dir()/atlas.sqlite3
 ```
 
-The app creates the app-data directory if needed. Schema setup is inline in
-`ChatStore::new()` with `CREATE TABLE IF NOT EXISTS`; there is no migration
-system yet.
+The app creates the app-data directory if needed. `ChatStore::new()` opens the
+database and calls `infra::sqlite::setup_database(&conn)`, which configures the
+connection and runs repeatable baseline schema setup. The current
+`chats`/`messages`/`generation_runs`/`jobs` schema is treated as baseline
+version 1 and recorded with `PRAGMA user_version = 1`.
 
-Foreign keys are enabled with:
+There is no migrations directory yet. Future schema changes should add
+idempotent versions after the v1 baseline instead of editing historical setup in
+ways that would break existing `atlas.sqlite3` files.
+
+Connection setup applies:
 
 ```sql
-PRAGMA foreign_keys = ON
+PRAGMA busy_timeout = 5000;
+PRAGMA foreign_keys = ON;
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
 ```
 
 Current tables:
@@ -325,7 +353,11 @@ Persistence behavior:
 - `export_chat` reads the chat, messages, and joined generation metadata,
   renders Markdown, JSON, or plain text in Rust, returns content with a
   sanitized filename and MIME type, and does not mutate SQLite.
-- WAL mode is not configured yet.
+- WAL mode is enabled for the file-backed desktop database.
+- `get_database_diagnostics` reads the database path, database/WAL/SHM sizes,
+  journal mode, schema user version, page counts, free pages, integrity check,
+  and table counts for core tables. It does not export chat content or mutate
+  user data.
 
 ## Chat Generation Flow
 
@@ -464,6 +496,7 @@ Current limitations:
 - Ollama models and selected model.
 - Model panel visibility and model action state.
 - Recent job records from `list_jobs` and `job_updated` events.
+- Database diagnostics modal, loading state, and error state.
 - Export menu visibility and active export format.
 - Command palette state, command query, active command index, command registry,
   fuzzy filtering, and disabled command reasons.
@@ -488,11 +521,16 @@ and model management show limited frontend-only states instead of calling Rust.
 The command palette opens with `Cmd/Ctrl+K`, focuses its search field, supports
 arrow/enter keyboard selection, and closes on escape or backdrop click. Initial
 enabled commands call existing handlers for new chat, chat search, model manager
-open, model refresh, model selection, recommended model downloads, and active
-chat deletion when valid. It also exposes active-chat export commands for
-Markdown, JSON, and plain text. Future surfaces such as settings, diagnostics,
-Model Lab, and folder indexing are represented as disabled commands with visible
-reasons instead of placeholder business logic.
+open, model refresh, model selection, recommended model downloads, database
+diagnostics, and active chat deletion when valid. It also exposes active-chat
+export commands for Markdown, JSON, and plain text. Future surfaces such as
+settings, Model Lab, and folder indexing are represented as disabled commands
+with visible reasons instead of placeholder business logic.
+
+The diagnostics command opens a focused database diagnostics modal in desktop
+mode. It shows SQLite path, database/WAL/SHM sizes, journal mode, schema version,
+integrity result, page stats, and core table counts. It is intentionally smaller
+than the future diagnostics center planned for later chunks.
 
 The active chat action group includes an export menu. Export rendering is
 backend-owned through `export_chat`; the frontend turns the returned content
@@ -522,6 +560,7 @@ Current user-visible error surfaces:
 - `modelError` for model refresh, download, and delete errors, with expandable
   technical details where available.
 - `chatSearchError` for search-specific failures.
+- `databaseDiagnosticsError` for database diagnostics loading failures.
 - Readiness notices for Ollama offline, no local models, selected model missing,
   and browser preview.
 - Per-message generation details for assistant messages with associated
@@ -543,18 +582,23 @@ The frontend suppresses that cancellation message in the active chat error UI.
 
 ## Fragile Areas Before Refactoring
 
-- `src-tauri/src/lib.rs` still mixes chat/export domain types, SQLite setup,
+- `src-tauri/src/lib.rs` still mixes chat/export domain types, SQLite
   repositories, chat-generation Ollama HTTP, streaming, cancellation, search,
   export, model pull/delete orchestration, and most Tauri command handlers.
-- Only the model listing/status slice currently has `domain`, `app`, and
-  `infra` boundaries.
+- Model listing/status and jobs now have partial `domain`, `app`, and `infra`
+  boundaries. SQLite setup/diagnostics has `domain` and `infra` modules. Chat,
+  search, export, and generation are still mostly in `lib.rs`.
 - The frontend still calls many chat/search `invoke()` commands directly from
-  `src/App.tsx`; only the touched Ollama/model commands have typed wrappers.
+  `src/App.tsx`; touched model, export, jobs, and diagnostics commands have
+  typed wrappers.
 - The command registry is centralized in `src/App.tsx`, but it is still coupled
   to local component state and handlers until frontend feature modules exist.
-- The schema is inline and repeatable, but not versioned.
+- Schema setup records baseline version 1, but there is not yet an incremental
+  migrations directory for future versions.
 - The SQLite connection is protected by one mutex, so long database work would
   block other database operations.
+- Database diagnostics are a focused modal, not the full diagnostics center
+  planned for later chunks.
 - Chat generation sends the full conversation every time; there is no prompt
   assembly layer or context diagnostics.
 - The generation task registry is in-memory and keyed only by chat ID.
@@ -576,6 +620,10 @@ command names and serialized model/status fields stay unchanged.
 Chunk 6 adds the persistent `jobs` table, `job_updated` events, `list_jobs`,
 `cancel_job`, and a streamed `model_pull` job behind `download_ollama_model`.
 Chat generation remains on its existing cancellation path for now.
+Chunk 7 moves SQLite setup into `infra::sqlite`, treats the current schema as
+baseline user version 1, enables WAL, keeps indexes scoped to current query
+paths, and adds a read-only database diagnostics command plus command-palette
+modal.
 
 Relevant checks:
 
