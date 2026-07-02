@@ -1,9 +1,15 @@
+mod app;
+mod domain;
+mod infra;
+
+use app::models as model_service;
+use domain::model::{validate_ollama_model_name, OllamaModel, OllamaStatus};
+use infra::ollama;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    io::{BufRead, BufReader, Read, Write},
-    net::{SocketAddr, TcpStream},
+    io::{BufRead, BufReader},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -95,34 +101,6 @@ struct GenerationCompletion {
     error_message: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
-struct OllamaModel {
-    name: String,
-    size: i64,
-}
-
-#[derive(Debug, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum OllamaStatusKind {
-    Unavailable,
-    RunningWithModels,
-    RunningWithoutModels,
-    SelectedModelMissing,
-}
-
-#[derive(Serialize)]
-struct OllamaStatus {
-    status: OllamaStatusKind,
-    models: Vec<OllamaModel>,
-    selected_model: Option<String>,
-    error: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct OllamaTagsResponse {
-    models: Vec<OllamaModel>,
-}
-
 #[derive(Serialize)]
 struct OllamaChatRequest {
     model: String,
@@ -165,11 +143,6 @@ struct OllamaChatStreamError {
     first_token_at: Option<i64>,
     metadata: GenerationMetadata,
     cancelled: bool,
-}
-
-struct OllamaResponse {
-    status_code: u16,
-    body: String,
 }
 
 impl ChatStore {
@@ -671,133 +644,6 @@ fn read_chat_message_with_generation_run(row: &Row<'_>) -> Result<ChatMessage, r
         created_at: row.get(4)?,
         generation_run: read_generation_run(row, 5)?,
     })
-}
-
-fn validate_ollama_model_name(model: &str) -> Result<String, String> {
-    let model = model.trim();
-
-    if model.is_empty() {
-        return Err("Model name cannot be empty".to_string());
-    }
-
-    if model
-        .chars()
-        .any(|character| character.is_whitespace() || character == '"' || character == '\\')
-    {
-        return Err("Model name contains invalid characters".to_string());
-    }
-
-    Ok(model.to_string())
-}
-
-fn normalize_selected_model(selected_model: Option<String>) -> Option<String> {
-    selected_model
-        .map(|model| model.trim().to_string())
-        .filter(|model| !model.is_empty())
-}
-
-fn ollama_request(
-    method: &str,
-    path: &str,
-    body: Option<String>,
-) -> Result<OllamaResponse, String> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], 11434));
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
-        .map_err(|_| "Ollama is not running. Open Ollama and try again.".to_string())?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(1200)))
-        .map_err(|error| error.to_string())?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(10)))
-        .map_err(|error| error.to_string())?;
-
-    let body = body.unwrap_or_default();
-    let request = format!(
-    "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:11434\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-    body.len(),
-    body
-  );
-
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| error.to_string())?;
-
-    let mut raw_response = String::new();
-    stream
-        .read_to_string(&mut raw_response)
-        .map_err(|error| error.to_string())?;
-
-    let (headers, body) = raw_response
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| "Ollama returned an invalid HTTP response".to_string())?;
-    let status_code = headers
-        .lines()
-        .next()
-        .and_then(|status| status.split_whitespace().nth(1))
-        .and_then(|status| status.parse::<u16>().ok())
-        .ok_or_else(|| "Ollama returned an invalid HTTP status".to_string())?;
-
-    Ok(OllamaResponse {
-        status_code,
-        body: body.to_string(),
-    })
-}
-
-fn ollama_error(response: &OllamaResponse) -> String {
-    if response.body.trim().is_empty() {
-        return format!("Ollama request failed with status {}", response.status_code);
-    }
-
-    serde_json::from_str::<serde_json::Value>(&response.body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("error")
-                .and_then(|error| error.as_str())
-                .map(ToString::to_string)
-        })
-        .unwrap_or_else(|| response.body.clone())
-}
-
-fn read_ollama_models() -> Result<Vec<OllamaModel>, String> {
-    let response = ollama_request("GET", "/api/tags", None)?;
-
-    if !(200..300).contains(&response.status_code) {
-        return Err(ollama_error(&response));
-    }
-
-    let tags = serde_json::from_str::<OllamaTagsResponse>(&response.body)
-        .map_err(|error| error.to_string())?;
-
-    Ok(tags.models)
-}
-
-fn build_ollama_status(
-    models: Vec<OllamaModel>,
-    selected_model: Option<String>,
-    error: Option<String>,
-) -> OllamaStatus {
-    let selected_model = normalize_selected_model(selected_model);
-    let status = if error.is_some() {
-        OllamaStatusKind::Unavailable
-    } else if models.is_empty() {
-        OllamaStatusKind::RunningWithoutModels
-    } else if selected_model.as_ref().is_some_and(|selected_model| {
-        !models
-            .iter()
-            .any(|model| model.name == selected_model.as_str())
-    }) {
-        OllamaStatusKind::SelectedModelMissing
-    } else {
-        OllamaStatusKind::RunningWithModels
-    };
-
-    OllamaStatus {
-        status,
-        models,
-        selected_model,
-        error,
-    }
 }
 
 fn metadata_from_ollama_chunk(chunk: &OllamaChatStreamResponse) -> GenerationMetadata {
@@ -1342,17 +1188,14 @@ fn export_chat(
 
 #[tauri::command]
 async fn get_ollama_status(selected_model: Option<String>) -> Result<OllamaStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || match read_ollama_models() {
-        Ok(models) => build_ollama_status(models, selected_model, None),
-        Err(error) => build_ollama_status(Vec::new(), selected_model, Some(error)),
-    })
-    .await
-    .map_err(|error| error.to_string())
+    tauri::async_runtime::spawn_blocking(move || model_service::get_status(selected_model))
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 async fn list_ollama_models() -> Result<Vec<OllamaModel>, String> {
-    tauri::async_runtime::spawn_blocking(read_ollama_models)
+    tauri::async_runtime::spawn_blocking(model_service::list_models)
         .await
         .map_err(|error| error.to_string())?
 }
@@ -1366,13 +1209,13 @@ async fn download_ollama_model(model: String) -> Result<Vec<OllamaModel>, String
           "stream": false
         })
         .to_string();
-        let response = ollama_request("POST", "/api/pull", Some(body))?;
+        let response = ollama::request("POST", "/api/pull", Some(body))?;
 
         if !(200..300).contains(&response.status_code) {
-            return Err(ollama_error(&response));
+            return Err(ollama::error(&response));
         }
 
-        read_ollama_models()
+        model_service::list_models()
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1383,13 +1226,13 @@ async fn delete_ollama_model(model: String) -> Result<Vec<OllamaModel>, String> 
     tauri::async_runtime::spawn_blocking(move || {
         let model = validate_ollama_model_name(&model)?;
         let body = serde_json::json!({ "name": model }).to_string();
-        let response = ollama_request("DELETE", "/api/delete", Some(body))?;
+        let response = ollama::request("DELETE", "/api/delete", Some(body))?;
 
         if !(200..300).contains(&response.status_code) {
-            return Err(ollama_error(&response));
+            return Err(ollama::error(&response));
         }
 
-        read_ollama_models()
+        model_service::list_models()
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1609,11 +1452,13 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use super::domain::model::{
+        build_ollama_status, validate_ollama_model_name, OllamaModel, OllamaStatusKind,
+    };
     use super::{
-        build_ollama_status, calculate_tokens_per_second, escape_like_pattern, format_timestamp_ms,
-        nanos_to_millis, normalize_title, render_chat_export, sanitize_file_name,
-        validate_ollama_model_name, ChatExportFormat, ChatMessage, ChatSummary, GenerationRun,
-        OllamaModel, OllamaStatusKind,
+        calculate_tokens_per_second, escape_like_pattern, format_timestamp_ms, nanos_to_millis,
+        normalize_title, render_chat_export, sanitize_file_name, ChatExportFormat, ChatMessage,
+        ChatSummary, GenerationRun,
     };
 
     fn test_model(name: &str) -> OllamaModel {

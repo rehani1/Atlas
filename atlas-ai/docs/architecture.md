@@ -12,16 +12,18 @@ Atlas is a local-first desktop chat app built with Tauri 2, Rust, React, Vite,
 Tailwind CSS, SQLite, and Ollama. The current codebase is intentionally compact:
 
 - Frontend UI and state live in `src/App.tsx`.
-- Backend state, SQLite access, Ollama access, command handlers, streaming, and
-  cancellation live in `src-tauri/src/lib.rs`.
+- Most backend state, SQLite access, command handlers, streaming, and
+  cancellation still live in `src-tauri/src/lib.rs`.
+- The first backend service slice is split across `src-tauri/src/domain/model.rs`,
+  `src-tauri/src/app/models.rs`, and `src-tauri/src/infra/ollama.rs`.
 - `src-tauri/src/main.rs` only starts `atlas_lib::run()`.
 - Public release docs are `README.md` and `CHANGELOG.md`.
 
 There is a minimal typed frontend API wrapper for touched Ollama status and
 model lifecycle commands in `src/shared/api/tauri.ts`. There are no frontend
-feature folders, Rust `commands`, `app`, `domain`, or `infra` modules, database
-migration files, job tables, event envelopes, diagnostics views, document
-indexing, memory, import, or model benchmark surfaces yet.
+feature folders, Rust `commands` module, database migration files, job tables,
+event envelopes, diagnostics views, document indexing, memory, import, or model
+benchmark surfaces yet.
 
 `src/App.tsx` now also owns a small frontend-only command registry and
 `Cmd/Ctrl+K` command palette. The registry uses stable command IDs and routes
@@ -72,8 +74,9 @@ React owns UI and interaction state:
 - Loading and error states.
 - Browser-preview fallback behavior when Tauri is unavailable.
 
-The current Tauri command handlers are not thin IPC wrappers yet. Most business
-logic is directly in `src-tauri/src/lib.rs`.
+Most Tauri command handlers are not thin IPC wrappers yet. The model status and
+model listing commands now call the model app service; the rest of the backend
+is still being migrated one vertical slice at a time.
 
 ## IPC Command Contract
 
@@ -318,13 +321,23 @@ cancellation before the first token still leaves no assistant message.
 
 Atlas assumes Ollama is local at `127.0.0.1:11434`.
 
+The first service-layer slice is model management:
+
+- `domain/model.rs` owns `OllamaModel`, `OllamaStatus`,
+  `OllamaStatusKind`, model-name validation, and status derivation.
+- `infra/ollama.rs` owns the blocking HTTP request helper, Ollama error-body
+  parsing, and `/api/tags` model-list parsing.
+- `app/models.rs` owns the model-listing and readiness-status service calls.
+
 Current model operations:
 
 - `get_ollama_status(selected_model)` calls `GET /api/tags` and returns one of
   four readiness states:
   `unavailable`, `running_with_models`, `running_without_models`, or
   `selected_model_missing`.
-- `list_ollama_models()` calls `GET /api/tags`.
+- `get_ollama_status(selected_model)` and `list_ollama_models()` are thin Tauri
+  wrappers over `app::models`.
+- `list_ollama_models()` calls `GET /api/tags` through `infra::ollama`.
 - `download_ollama_model(model)` validates the model name, calls
   `POST /api/pull` with `{ "name": model, "stream": false }`, then refreshes
   the model list.
@@ -339,6 +352,9 @@ Current limitations:
 
 - Model pull is blocking from the user's perspective.
 - Model pull uses `stream: false`, so there is no progress reporting.
+- Model pull/delete still have command-level orchestration in `lib.rs`; they
+  share extracted validation and Ollama HTTP infra, but are not fully service
+  commands yet.
 - There is no persistent job record for downloads or deletes.
 
 ## Search Behavior
@@ -444,8 +460,11 @@ The frontend suppresses that cancellation message in the active chat error UI.
 
 ## Fragile Areas Before Refactoring
 
-- `src-tauri/src/lib.rs` mixes domain types, SQLite setup, repositories, Ollama
-  HTTP, streaming, cancellation, and Tauri command handlers.
+- `src-tauri/src/lib.rs` still mixes chat/export domain types, SQLite setup,
+  repositories, chat-generation Ollama HTTP, streaming, cancellation, search,
+  export, model pull/delete orchestration, and most Tauri command handlers.
+- Only the model listing/status slice currently has `domain`, `app`, and
+  `infra` boundaries.
 - The frontend still calls many chat/search `invoke()` commands directly from
   `src/App.tsx`; only the touched Ollama/model commands have typed wrappers.
 - The command registry is centralized in `src/App.tsx`, but it is still coupled
@@ -468,7 +487,9 @@ The frontend suppresses that cancellation message in the active chat error UI.
 The baseline, first-run, and message-diagnostics chunks intentionally preserve
 existing chat, search, and model lifecycle command names. Chunk 2 adds the
 repeatable `generation_runs` schema extension. Chunk 4 adds `export_chat`
-without adding a dialog plugin or changing Tauri permissions.
+without adding a dialog plugin or changing Tauri permissions. Chunk 5 starts the
+backend service-layer migration with model listing/status and validation only;
+command names and serialized model/status fields stay unchanged.
 
 Relevant checks:
 
