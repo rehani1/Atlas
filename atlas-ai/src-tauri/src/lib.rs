@@ -61,6 +61,21 @@ struct GenerationRun {
     error_message: Option<String>,
 }
 
+#[derive(Copy, Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ChatExportFormat {
+    Markdown,
+    Json,
+    PlainText,
+}
+
+#[derive(Serialize)]
+struct ChatExport {
+    file_name: String,
+    mime_type: String,
+    content: String,
+}
+
 #[derive(Clone, Debug, Default)]
 struct GenerationMetadata {
     total_duration_ms: Option<i64>,
@@ -281,6 +296,316 @@ fn escape_like_pattern(value: &str) -> String {
     }
 
     escaped
+}
+
+fn sanitize_file_name(value: &str) -> String {
+    let mut sanitized = String::new();
+    let mut previous_was_separator = false;
+
+    for character in value.trim().chars() {
+        if character.is_ascii_alphanumeric() {
+            sanitized.push(character.to_ascii_lowercase());
+            previous_was_separator = false;
+        } else if (character.is_whitespace() || matches!(character, '-' | '_'))
+            && !sanitized.is_empty()
+            && !previous_was_separator
+        {
+            sanitized.push('-');
+            previous_was_separator = true;
+        }
+
+        if sanitized.len() >= 80 {
+            break;
+        }
+    }
+
+    let sanitized = sanitized.trim_matches('-').to_string();
+    if sanitized.is_empty() {
+        "atlas-chat".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let month_piece = (5 * doy + 2) / 153;
+    let day = doy - (153 * month_piece + 2) / 5 + 1;
+    let month = month_piece + if month_piece < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+
+    (year, month, day)
+}
+
+fn format_timestamp_ms(timestamp_ms: i64) -> String {
+    let seconds = timestamp_ms.div_euclid(1_000);
+    let milliseconds = timestamp_ms.rem_euclid(1_000);
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hours = day_seconds / 3_600;
+    let minutes = (day_seconds % 3_600) / 60;
+    let seconds = day_seconds % 60;
+
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{milliseconds:03}Z")
+}
+
+fn format_duration_for_export(duration_ms: i64) -> String {
+    if duration_ms < 1_000 {
+        return format!("{duration_ms} ms");
+    }
+
+    format!("{:.2} s", duration_ms as f64 / 1_000.0)
+}
+
+fn chat_export_format_parts(format: ChatExportFormat) -> (&'static str, &'static str) {
+    match format {
+        ChatExportFormat::Markdown => ("md", "text/markdown;charset=utf-8"),
+        ChatExportFormat::Json => ("json", "application/json;charset=utf-8"),
+        ChatExportFormat::PlainText => ("txt", "text/plain;charset=utf-8"),
+    }
+}
+
+fn role_label(role: &str) -> &str {
+    match role {
+        "assistant" => "Assistant",
+        "system" => "System",
+        "user" => "User",
+        _ => "Message",
+    }
+}
+
+fn escape_markdown_inline(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+
+    for character in value.chars() {
+        if matches!(
+            character,
+            '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '(' | ')' | '#'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+
+    escaped
+}
+
+fn append_generation_markdown(output: &mut String, run: &GenerationRun) {
+    output.push_str("\n\nGeneration details:\n\n");
+    output.push_str(&format!("- Model: `{}`\n", run.model_name));
+    output.push_str(&format!("- Status: {}\n", run.status));
+
+    if let Some(total_duration_ms) = run.total_duration_ms {
+        output.push_str(&format!(
+            "- Total duration: {}\n",
+            format_duration_for_export(total_duration_ms)
+        ));
+    }
+
+    if let Some(load_duration_ms) = run.load_duration_ms {
+        output.push_str(&format!(
+            "- Load duration: {}\n",
+            format_duration_for_export(load_duration_ms)
+        ));
+    }
+
+    if let Some(prompt_eval_count) = run.prompt_eval_count {
+        output.push_str(&format!("- Prompt tokens: {prompt_eval_count}\n"));
+    }
+
+    if let Some(eval_count) = run.eval_count {
+        output.push_str(&format!("- Completion tokens: {eval_count}\n"));
+    }
+
+    if let Some(tokens_per_second) = run.tokens_per_second {
+        output.push_str(&format!("- Speed: {:.1} tokens/s\n", tokens_per_second));
+    }
+
+    if let Some(error_message) = &run.error_message {
+        output.push_str(&format!("- Error: {error_message}\n"));
+    }
+}
+
+fn append_generation_text(output: &mut String, run: &GenerationRun) {
+    let mut details = vec![
+        format!("model: {}", run.model_name),
+        format!("status: {}", run.status),
+    ];
+
+    if let Some(total_duration_ms) = run.total_duration_ms {
+        details.push(format!(
+            "total: {}",
+            format_duration_for_export(total_duration_ms)
+        ));
+    }
+
+    if let Some(prompt_eval_count) = run.prompt_eval_count {
+        details.push(format!("prompt tokens: {prompt_eval_count}"));
+    }
+
+    if let Some(eval_count) = run.eval_count {
+        details.push(format!("completion tokens: {eval_count}"));
+    }
+
+    if let Some(tokens_per_second) = run.tokens_per_second {
+        details.push(format!("speed: {:.1} tokens/s", tokens_per_second));
+    }
+
+    if let Some(error_message) = &run.error_message {
+        details.push(format!("error: {error_message}"));
+    }
+
+    output.push_str(&format!("Generation: {}\n", details.join("; ")));
+}
+
+fn render_chat_export_markdown(
+    chat: &ChatSummary,
+    messages: &[ChatMessage],
+    exported_at: i64,
+) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("# {}\n\n", escape_markdown_inline(&chat.title)));
+    output.push_str(&format!("- Chat ID: `{}`\n", chat.id));
+    output.push_str(&format!(
+        "- Created: {}\n",
+        format_timestamp_ms(chat.created_at)
+    ));
+    output.push_str(&format!(
+        "- Updated: {}\n",
+        format_timestamp_ms(chat.updated_at)
+    ));
+    output.push_str(&format!(
+        "- Exported: {}\n",
+        format_timestamp_ms(exported_at)
+    ));
+    output.push_str(&format!("- Messages: {}\n\n", chat.message_count));
+
+    if messages.is_empty() {
+        output.push_str("_No messages._\n");
+        return output;
+    }
+
+    for message in messages {
+        output.push_str(&format!(
+            "## {} - {}\n\n",
+            role_label(&message.role),
+            format_timestamp_ms(message.created_at)
+        ));
+        output.push_str(&message.content);
+
+        if let Some(run) = &message.generation_run {
+            append_generation_markdown(&mut output, run);
+        }
+
+        output.push_str("\n\n");
+    }
+
+    output
+}
+
+fn render_chat_export_text(
+    chat: &ChatSummary,
+    messages: &[ChatMessage],
+    exported_at: i64,
+) -> String {
+    let mut output = String::new();
+    output.push_str(&chat.title);
+    output.push('\n');
+    output.push_str(&"=".repeat(chat.title.chars().count().max(1)));
+    output.push_str("\n\n");
+    output.push_str(&format!("Chat ID: {}\n", chat.id));
+    output.push_str(&format!(
+        "Created: {}\n",
+        format_timestamp_ms(chat.created_at)
+    ));
+    output.push_str(&format!(
+        "Updated: {}\n",
+        format_timestamp_ms(chat.updated_at)
+    ));
+    output.push_str(&format!("Exported: {}\n", format_timestamp_ms(exported_at)));
+    output.push_str(&format!("Messages: {}\n\n", chat.message_count));
+
+    if messages.is_empty() {
+        output.push_str("No messages.\n");
+        return output;
+    }
+
+    for message in messages {
+        output.push_str(&format!(
+            "[{} | {}]\n",
+            role_label(&message.role),
+            format_timestamp_ms(message.created_at)
+        ));
+        output.push_str(&message.content);
+        output.push('\n');
+
+        if let Some(run) = &message.generation_run {
+            append_generation_text(&mut output, run);
+        }
+
+        output.push('\n');
+    }
+
+    output
+}
+
+fn render_chat_export_json(
+    chat: &ChatSummary,
+    messages: &[ChatMessage],
+    exported_at: i64,
+) -> Result<String, String> {
+    let messages = messages
+        .iter()
+        .map(|message| {
+            serde_json::json!({
+              "id": message.id,
+              "chat_id": &message.chat_id,
+              "role": &message.role,
+              "content": &message.content,
+              "created_at": message.created_at,
+              "created_at_iso": format_timestamp_ms(message.created_at),
+              "generation_run": &message.generation_run
+            })
+        })
+        .collect::<Vec<_>>();
+    let document = serde_json::json!({
+      "format_version": 1,
+      "exported_at": exported_at,
+      "exported_at_iso": format_timestamp_ms(exported_at),
+      "chat": {
+        "id": &chat.id,
+        "title": &chat.title,
+        "created_at": chat.created_at,
+        "created_at_iso": format_timestamp_ms(chat.created_at),
+        "updated_at": chat.updated_at,
+        "updated_at_iso": format_timestamp_ms(chat.updated_at),
+        "message_count": chat.message_count
+      },
+      "messages": messages
+    });
+
+    serde_json::to_string_pretty(&document)
+        .map(|content| format!("{content}\n"))
+        .map_err(|error| error.to_string())
+}
+
+fn render_chat_export(
+    chat: &ChatSummary,
+    messages: &[ChatMessage],
+    format: ChatExportFormat,
+    exported_at: i64,
+) -> Result<String, String> {
+    match format {
+        ChatExportFormat::Markdown => Ok(render_chat_export_markdown(chat, messages, exported_at)),
+        ChatExportFormat::Json => render_chat_export_json(chat, messages, exported_at),
+        ChatExportFormat::PlainText => Ok(render_chat_export_text(chat, messages, exported_at)),
+    }
 }
 
 fn create_id(conn: &Connection) -> Result<String, rusqlite::Error> {
@@ -984,6 +1309,38 @@ fn delete_chat(store: State<'_, ChatStore>, chat_id: String) -> Result<bool, Str
 }
 
 #[tauri::command]
+fn export_chat(
+    store: State<'_, ChatStore>,
+    chat_id: String,
+    format: ChatExportFormat,
+) -> Result<ChatExport, String> {
+    let exported_at = now_millis()?;
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| "Database lock was poisoned".to_string())?;
+    let chat = get_chat_summary(&conn, &chat_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Chat was not found".to_string())?;
+    let messages = list_messages_for_chat(&conn, &chat_id).map_err(|error| error.to_string())?;
+    let content = render_chat_export(&chat, &messages, format, exported_at)?;
+    let (extension, mime_type) = chat_export_format_parts(format);
+    let short_id = chat.id.chars().take(8).collect::<String>();
+    let file_name = format!(
+        "{}-{}.{}",
+        sanitize_file_name(&chat.title),
+        short_id,
+        extension
+    );
+
+    Ok(ChatExport {
+        file_name,
+        mime_type: mime_type.to_string(),
+        content,
+    })
+}
+
+#[tauri::command]
 async fn get_ollama_status(selected_model: Option<String>) -> Result<OllamaStatus, String> {
     tauri::async_runtime::spawn_blocking(move || match read_ollama_models() {
         Ok(models) => build_ollama_status(models, selected_model, None),
@@ -1238,6 +1595,7 @@ pub fn run() {
             get_messages,
             add_message,
             delete_chat,
+            export_chat,
             get_ollama_status,
             list_ollama_models,
             download_ollama_model,
@@ -1252,8 +1610,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_ollama_status, calculate_tokens_per_second, escape_like_pattern, nanos_to_millis,
-        normalize_title, validate_ollama_model_name, OllamaModel, OllamaStatusKind,
+        build_ollama_status, calculate_tokens_per_second, escape_like_pattern, format_timestamp_ms,
+        nanos_to_millis, normalize_title, render_chat_export, sanitize_file_name,
+        validate_ollama_model_name, ChatExportFormat, ChatMessage, ChatSummary, GenerationRun,
+        OllamaModel, OllamaStatusKind,
     };
 
     fn test_model(name: &str) -> OllamaModel {
@@ -1326,6 +1686,91 @@ mod tests {
             None
         );
         assert_eq!(calculate_tokens_per_second(None, Some(2_000_000_000)), None);
+    }
+
+    #[test]
+    fn format_timestamp_ms_outputs_utc_iso_8601() {
+        assert_eq!(
+            format_timestamp_ms(0),
+            "1970-01-01T00:00:00.000Z".to_string()
+        );
+        assert_eq!(
+            format_timestamp_ms(1_700_000_000_123),
+            "2023-11-14T22:13:20.123Z".to_string()
+        );
+    }
+
+    #[test]
+    fn sanitize_file_name_keeps_exports_safe_and_readable() {
+        assert_eq!(
+            sanitize_file_name("  Quarterly Chat: Plan / Draft?  "),
+            "quarterly-chat-plan-draft"
+        );
+        assert_eq!(sanitize_file_name("////"), "atlas-chat");
+    }
+
+    #[test]
+    fn render_chat_export_includes_metrics_and_failed_states() {
+        let chat = ChatSummary {
+            id: "abcdef123456".to_string(),
+            title: "Export Check".to_string(),
+            created_at: 0,
+            updated_at: 1_700_000_000_123,
+            message_count: 2,
+        };
+        let messages = vec![
+            ChatMessage {
+                id: 1,
+                chat_id: chat.id.clone(),
+                role: "user".to_string(),
+                content: "Summarize this.".to_string(),
+                created_at: 0,
+                generation_run: None,
+            },
+            ChatMessage {
+                id: 2,
+                chat_id: chat.id.clone(),
+                role: "assistant".to_string(),
+                content: "Partial answer".to_string(),
+                created_at: 1_000,
+                generation_run: Some(GenerationRun {
+                    id: "run-1".to_string(),
+                    conversation_id: chat.id.clone(),
+                    message_id: Some(2),
+                    model_name: "llama3.2:3b".to_string(),
+                    started_at: 900,
+                    first_token_at: Some(950),
+                    completed_at: Some(1_100),
+                    status: "failed".to_string(),
+                    total_duration_ms: Some(1_500),
+                    load_duration_ms: Some(25),
+                    prompt_eval_count: Some(12),
+                    prompt_eval_duration_ms: Some(20),
+                    eval_count: Some(6),
+                    eval_duration_ms: Some(100),
+                    tokens_per_second: Some(60.0),
+                    error_message: Some("Generation failed".to_string()),
+                }),
+            },
+        ];
+
+        let markdown =
+            render_chat_export(&chat, &messages, ChatExportFormat::Markdown, 2_000).unwrap();
+        assert!(markdown.contains("# Export Check"));
+        assert!(markdown.contains("- Model: `llama3.2:3b`"));
+        assert!(markdown.contains("- Status: failed"));
+        assert!(markdown.contains("- Speed: 60.0 tokens/s"));
+        assert!(markdown.contains("- Error: Generation failed"));
+
+        let json = render_chat_export(&chat, &messages, ChatExportFormat::Json, 2_000).unwrap();
+        let value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+        assert_eq!(value["format_version"], 1);
+        assert_eq!(value["chat"]["title"], "Export Check");
+        assert_eq!(value["messages"][1]["generation_run"]["status"], "failed");
+
+        let text =
+            render_chat_export(&chat, &messages, ChatExportFormat::PlainText, 2_000).unwrap();
+        assert!(text.contains("Generation: model: llama3.2:3b; status: failed"));
     }
 
     #[test]

@@ -9,7 +9,10 @@ import {
 import {
   deleteOllamaModel,
   downloadOllamaModel,
+  exportChat,
   getOllamaStatus,
+  type ChatExport,
+  type ChatExportFormat,
   type ChatMessage,
   type GenerationRun,
   type OllamaModel,
@@ -42,8 +45,8 @@ type CommandId =
   | 'model.switch.open'
   | `model.switch:${string}`
   | `model.download:${string}`
+  | `chat.export.${ChatExportFormat}`
   | 'settings.open'
-  | 'chat.export_current'
   | 'diagnostics.open'
   | 'model_lab.open'
   | 'knowledge.index_folder'
@@ -61,6 +64,7 @@ type AppCommand = {
 type CommandRegistryContext = {
   activeChatId: string | null
   deletingChatId: string | null
+  exportAction: ChatExportFormat | null
   isDesktop: boolean
   isOllamaStatusLoading: boolean
   modelAction: string | null
@@ -69,6 +73,7 @@ type CommandRegistryContext = {
   selectedModel: string
   onDeleteActiveChat: () => Promise<void>
   onDownloadModel: (model: string) => Promise<void>
+  onExportChat: (format: ChatExportFormat) => Promise<void>
   onNewChat: () => Promise<void>
   onOpenChatSearch: () => void
   onOpenModelManager: () => void
@@ -86,6 +91,11 @@ const isTauriRuntime = () => window.__TAURI_INTERNALS__ !== undefined
 const recommendedModels = [
   { name: 'llama3.2:1b', note: 'Fastest' },
   { name: 'llama3.2:3b', note: 'Best default' },
+]
+const chatExportFormats: { format: ChatExportFormat; label: string }[] = [
+  { format: 'markdown', label: 'Markdown' },
+  { format: 'json', label: 'JSON' },
+  { format: 'plain_text', label: 'Plain text' },
 ]
 const browserOllamaStatus: OllamaStatus = {
   status: 'unavailable',
@@ -362,6 +372,37 @@ function getDownloadModelDisabledReason(
   return undefined
 }
 
+function getExportChatDisabledReason(context: CommandRegistryContext) {
+  if (!context.activeChatId) {
+    return 'Open a chat before exporting.'
+  }
+
+  if (!context.isDesktop) {
+    return 'Chat export requires the Tauri desktop app.'
+  }
+
+  if (context.exportAction !== null) {
+    return 'Wait for the current export to finish.'
+  }
+
+  return undefined
+}
+
+function saveChatExport(exportedChat: ChatExport) {
+  const blob = new Blob([exportedChat.content], {
+    type: exportedChat.mime_type,
+  })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = exportedChat.file_name
+  link.rel = 'noopener'
+  document.body.append(link)
+  link.click()
+  link.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 0)
+}
+
 function buildCommandRegistry(context: CommandRegistryContext): AppCommand[] {
   const commands: AppCommand[] = [
     {
@@ -449,6 +490,18 @@ function buildCommandRegistry(context: CommandRegistryContext): AppCommand[] {
     })
   })
 
+  chatExportFormats.forEach((format) => {
+    commands.push({
+      id: `chat.export.${format.format}`,
+      title: `Export current chat as ${format.label}`,
+      category: 'Chat',
+      description: 'Save the open conversation locally.',
+      disabledReason: getExportChatDisabledReason(context),
+      keywords: ['download save transcript'],
+      run: () => context.onExportChat(format.format),
+    })
+  })
+
   commands.push(
     {
       id: 'settings.open',
@@ -457,15 +510,6 @@ function buildCommandRegistry(context: CommandRegistryContext): AppCommand[] {
       description: 'Configure Atlas.',
       disabledReason: 'Settings have not been added yet.',
       keywords: ['preferences'],
-      run: () => undefined,
-    },
-    {
-      id: 'chat.export_current',
-      title: 'Export current chat',
-      category: 'Chat',
-      description: 'Save the open conversation.',
-      disabledReason: 'Chat export lands in Chunk 4.',
-      keywords: ['download save'],
       run: () => undefined,
     },
     {
@@ -687,6 +731,25 @@ function TrashIcon({ className = 'h-5 w-5' }: IconProps) {
   )
 }
 
+function DownloadIcon({ className = 'h-5 w-5' }: IconProps) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M12 3v11" />
+      <path d="m7 9 5 5 5-5" />
+      <path d="M5 20h14" />
+    </svg>
+  )
+}
+
 function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true)
   const [chats, setChats] = useState<ChatSummary[]>([])
@@ -708,6 +771,8 @@ function App() {
   const [isResponding, setIsResponding] = useState(false)
   const [respondingChatId, setRespondingChatId] = useState<string | null>(null)
   const [deletingChatId, setDeletingChatId] = useState<string | null>(null)
+  const [exportAction, setExportAction] = useState<ChatExportFormat | null>(null)
+  const [isExportMenuOpen, setIsExportMenuOpen] = useState(false)
   const [isChatSearchOpen, setIsChatSearchOpen] = useState(false)
   const [chatSearchQuery, setChatSearchQuery] = useState('')
   const [chatSearchResults, setChatSearchResults] = useState<ChatSummary[]>([])
@@ -1035,6 +1100,7 @@ function App() {
     setActiveChatId(null)
     setMessages([])
     setDraft('')
+    setIsExportMenuOpen(false)
     closeChatSearch()
   }
 
@@ -1044,6 +1110,7 @@ function App() {
 
   async function handleSelectChat(chatId: string) {
     setActiveChatId(chatId)
+    setIsExportMenuOpen(false)
     closeChatSearch()
   }
 
@@ -1185,6 +1252,7 @@ function App() {
       setActiveChatId(null)
       setMessages([])
       setDraft('')
+      setIsExportMenuOpen(false)
       setHistoryError(null)
 
       if (respondingChatId === chatId) {
@@ -1195,6 +1263,29 @@ function App() {
       setHistoryError(String(error))
     } finally {
       setDeletingChatId(null)
+    }
+  }
+
+  async function handleExportActiveChat(format: ChatExportFormat) {
+    if (!activeChatId || !isTauriRuntime()) {
+      setHistoryError(
+        activeChatId
+          ? 'Chat export requires the Tauri desktop app.'
+          : 'Open a chat before exporting.',
+      )
+      return
+    }
+
+    try {
+      setExportAction(format)
+      const exportedChat = await exportChat(activeChatId, format)
+      saveChatExport(exportedChat)
+      setIsExportMenuOpen(false)
+      setHistoryError(null)
+    } catch (error) {
+      setHistoryError(String(error))
+    } finally {
+      setExportAction(null)
     }
   }
 
@@ -1223,6 +1314,7 @@ function App() {
   const commandEntries = buildCommandRegistry({
     activeChatId,
     deletingChatId,
+    exportAction,
     isDesktop: isTauriRuntime(),
     isOllamaStatusLoading,
     modelAction,
@@ -1231,6 +1323,7 @@ function App() {
     selectedModel,
     onDeleteActiveChat: handleDeleteActiveChat,
     onDownloadModel: handleDownloadModel,
+    onExportChat: handleExportActiveChat,
     onNewChat: handleNewChat,
     onOpenChatSearch: openChatSearch,
     onOpenModelManager: openModelManager,
@@ -1435,15 +1528,53 @@ function App() {
 
       <main className="relative min-h-svh min-w-0 flex-1 overflow-hidden" aria-label="Chat">
         {activeChatId ? (
-          <button
-            className="absolute top-4 right-4 z-10 grid h-10 w-10 place-items-center rounded-xl border border-red-950/80 bg-black/90 text-red-300 shadow-[0_12px_36px_rgba(0,0,0,0.35)] transition-colors hover:bg-red-950/30 hover:text-red-100 disabled:cursor-not-allowed disabled:opacity-50"
-            type="button"
-            aria-label="Delete chat"
-            disabled={deletingChatId === activeChatId}
-            onClick={handleDeleteActiveChat}
-          >
-            <TrashIcon />
-          </button>
+          <div className="absolute top-4 right-4 z-10 flex items-start gap-2">
+            <div className="relative">
+              <button
+                className="grid h-10 w-10 place-items-center rounded-xl border border-zinc-800 bg-black/90 text-zinc-300 shadow-[0_12px_36px_rgba(0,0,0,0.35)] transition-colors hover:bg-zinc-950 hover:text-zinc-100 disabled:cursor-not-allowed disabled:opacity-50"
+                type="button"
+                aria-label="Export chat"
+                aria-expanded={isExportMenuOpen}
+                aria-controls="chat-export-menu"
+                disabled={exportAction !== null}
+                onClick={() => setIsExportMenuOpen((isOpen) => !isOpen)}
+              >
+                <DownloadIcon />
+              </button>
+
+              {isExportMenuOpen ? (
+                <div
+                  className="absolute top-12 right-0 w-44 overflow-hidden rounded-xl border border-zinc-800 bg-zinc-950 p-1 shadow-[0_18px_50px_rgba(0,0,0,0.45)]"
+                  id="chat-export-menu"
+                >
+                  {chatExportFormats.map((format) => (
+                    <button
+                      className="flex min-h-10 w-full items-center justify-between gap-3 rounded-lg border-0 bg-transparent px-3 text-left text-sm text-zinc-200 transition-colors hover:bg-zinc-900 disabled:cursor-not-allowed disabled:text-zinc-600"
+                      key={format.format}
+                      type="button"
+                      disabled={exportAction !== null}
+                      onClick={() => handleExportActiveChat(format.format)}
+                    >
+                      <span className="truncate">{format.label}</span>
+                      {exportAction === format.format ? (
+                        <span className="text-xs text-zinc-500">Saving</span>
+                      ) : null}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+
+            <button
+              className="grid h-10 w-10 place-items-center rounded-xl border border-red-950/80 bg-black/90 text-red-300 shadow-[0_12px_36px_rgba(0,0,0,0.35)] transition-colors hover:bg-red-950/30 hover:text-red-100 disabled:cursor-not-allowed disabled:opacity-50"
+              type="button"
+              aria-label="Delete chat"
+              disabled={deletingChatId === activeChatId}
+              onClick={handleDeleteActiveChat}
+            >
+              <TrashIcon />
+            </button>
+          </div>
         ) : null}
 
         <div className="absolute top-4 left-4 z-10 w-[min(360px,calc(100%-2rem))]">

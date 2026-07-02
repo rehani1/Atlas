@@ -21,7 +21,7 @@ There is a minimal typed frontend API wrapper for touched Ollama status and
 model lifecycle commands in `src/shared/api/tauri.ts`. There are no frontend
 feature folders, Rust `commands`, `app`, `domain`, or `infra` modules, database
 migration files, job tables, event envelopes, diagnostics views, document
-indexing, memory, export, or model benchmark surfaces yet.
+indexing, memory, import, or model benchmark surfaces yet.
 
 `src/App.tsx` now also owns a small frontend-only command registry and
 `Cmd/Ctrl+K` command palette. The registry uses stable command IDs and routes
@@ -86,6 +86,7 @@ create_chat(title: Option<String>) -> ChatSummary
 get_messages(chat_id: String) -> Vec<ChatMessage>
 add_message(chat_id: String, role: String, content: String) -> ChatMessage
 delete_chat(chat_id: String) -> bool
+export_chat(chat_id: String, format: ChatExportFormat) -> ChatExport
 get_ollama_status(selected_model: Option<String>) -> OllamaStatus
 list_ollama_models() -> Vec<OllamaModel>
 download_ollama_model(model: String) -> Vec<OllamaModel>
@@ -132,6 +133,14 @@ GenerationRun
 - eval_duration_ms: number | null
 - tokens_per_second: number | null
 - error_message: string | null
+
+ChatExportFormat
+- "markdown" | "json" | "plain_text"
+
+ChatExport
+- file_name: string
+- mime_type: string
+- content: string
 
 OllamaModel
 - name: string
@@ -240,6 +249,9 @@ Persistence behavior:
 - `generation_runs` rows are created before generation starts and are finalized
   with completed, cancelled, or failed status.
 - Assistant messages expose at most one associated generation run.
+- `export_chat` reads the chat, messages, and joined generation metadata,
+  renders Markdown, JSON, or plain text in Rust, returns content with a
+  sanitized filename and MIME type, and does not mutate SQLite.
 - WAL mode is not configured yet.
 
 ## Chat Generation Flow
@@ -359,6 +371,7 @@ Current limitations:
 - Ollama readiness status and readiness loading state.
 - Ollama models and selected model.
 - Model panel visibility and model action state.
+- Export menu visibility and active export format.
 - Command palette state, command query, active command index, command registry,
   fuzzy filtering, and disabled command reasons.
 - Generation state, including `isResponding` and `respondingChatId`.
@@ -381,9 +394,15 @@ The command palette opens with `Cmd/Ctrl+K`, focuses its search field, supports
 arrow/enter keyboard selection, and closes on escape or backdrop click. Initial
 enabled commands call existing handlers for new chat, chat search, model manager
 open, model refresh, model selection, recommended model downloads, and active
-chat deletion when valid. Future surfaces such as settings, chat export,
-diagnostics, Model Lab, and folder indexing are represented as disabled commands
-with visible reasons instead of placeholder business logic.
+chat deletion when valid. It also exposes active-chat export commands for
+Markdown, JSON, and plain text. Future surfaces such as settings, diagnostics,
+Model Lab, and folder indexing are represented as disabled commands with visible
+reasons instead of placeholder business logic.
+
+The active chat action group includes an export menu. Export rendering is
+backend-owned through `export_chat`; the frontend turns the returned content
+into a local browser/WebView download. No dialog plugin or additional Tauri
+capability has been added.
 
 The first-run readiness surface handles:
 
@@ -400,7 +419,7 @@ Backend commands return `Result<_, String>`.
 Current user-visible error surfaces:
 
 - `historyError` for chat, search-adjacent chat loading, generation, deletion,
-  and database errors.
+  export, and database errors.
 - `modelError` for model refresh, download, and delete errors, with expandable
   technical details where available.
 - `chatSearchError` for search-specific failures.
@@ -448,8 +467,8 @@ The frontend suppresses that cancellation message in the active chat error UI.
 
 The baseline, first-run, and message-diagnostics chunks intentionally preserve
 existing chat, search, and model lifecycle command names. Chunk 2 adds the
-repeatable `generation_runs` schema extension. No Tauri permission changes have
-been added yet.
+repeatable `generation_runs` schema extension. Chunk 4 adds `export_chat`
+without adding a dialog plugin or changing Tauri permissions.
 
 Relevant checks:
 

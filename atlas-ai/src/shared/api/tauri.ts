@@ -46,10 +46,19 @@ export type OllamaStatus = {
   error: string | null
 }
 
+export type ChatExportFormat = 'markdown' | 'json' | 'plain_text'
+
+export type ChatExport = {
+  file_name: string
+  mime_type: string
+  content: string
+}
+
 const commands = {
   getOllamaStatus: 'get_ollama_status',
   downloadOllamaModel: 'download_ollama_model',
   deleteOllamaModel: 'delete_ollama_model',
+  exportChat: 'export_chat',
 } as const
 
 export function getOllamaStatus(selectedModel?: string) {
@@ -64,4 +73,8 @@ export function downloadOllamaModel(model: string) {
 
 export function deleteOllamaModel(model: string) {
   return invoke<OllamaModel[]>(commands.deleteOllamaModel, { model })
+}
+
+export function exportChat(chatId: string, format: ChatExportFormat) {
+  return invoke<ChatExport>(commands.exportChat, { chatId, format })
 }
