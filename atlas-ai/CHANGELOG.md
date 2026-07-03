@@ -1,12 +1,48 @@
 # Changelog
 
-## 1.1.0 - 2026-07-02
+## v1.1.0 - Atlas Local Workspace Upgrade
 
-Current local-first Atlas release.
+### Added
 
-## 1.0.0 - 2026-06-03
+- Diagnostics Center for app version, Ollama state, jobs, SQLite health,
+  knowledge counts, model speed history, and recent backend errors.
+- Model Lab MVP for local model benchmarking and benchmark history.
+- Persistent job system for long-running work such as model downloads,
+  knowledge indexing, benchmarks, and conversation summaries.
+- Command palette for faster desktop navigation.
+- Chat export in Markdown, JSON, and plain text formats.
+- Conversation summaries with per-chat prompt inclusion controls.
+- Transparent memory MVP with create, edit, archive, restore, forget, pin, and
+  source-link flows.
+- Local Knowledge Workspace MVP for approved text/code files.
+- Context assembly diagnostics for summaries, memories, prior messages,
+  document chunks, model options, and truncation notices.
+- Permissioned local tool-call surfaces for read-limited Atlas tools.
 
-Initial stable release of Atlas.
+### Improved
+
+- First-run, empty, loading, and error states across local model and chat flows.
+- SQLite durability, indexing, diagnostics, and local schema coverage.
+- Search quality with FTS-backed chat, message, and knowledge results where
+  implemented.
+- Rust backend organization around service-layer boundaries for models, jobs,
+  search, diagnostics, benchmarks, summaries, memories, knowledge, context, and
+  tools.
+- Local model diagnostics with timing, token, and speed metrics when Ollama
+  returns generation metadata.
+- Safe chat switching and cancellation behavior during in-progress generation.
+
+### Not Included Yet
+
+- Frontend token streaming from Rust events.
+- Embeddings, vector search, or hybrid semantic retrieval.
+- Automatic file watching and re-indexing.
+- PDF/DOCX parsing.
+- Cloud sync, hosted model providers, mobile support, voice mode, multi-agent
+  workflows, or plugin marketplace.
+- Arbitrary shell execution.
+
+## v1.0.0 - Initial Stable Release
 
 ### Added
 
